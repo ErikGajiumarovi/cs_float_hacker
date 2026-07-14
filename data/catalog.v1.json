@@ -1,0 +1,108 @@
+{
+  "schema_version": "2026-07-14.fixture.1",
+  "source": {
+    "name": "ByMykel/CSGO-API",
+    "url": "https://github.com/ByMykel/CSGO-API",
+    "license": "MIT",
+    "retrieved_at": "2026-07-14",
+    "note": "This small checked-in subset was transcribed from the upstream skins and collections endpoints. It is for mathematical MVP coverage, not a complete live catalog."
+  },
+  "skins": [
+    {
+      "id": "m4a1s-knight",
+      "name": "M4A1-S | Knight",
+      "collection_id": "cobblestone",
+      "collection_name": "The Cobblestone Collection",
+      "rarity": "classified",
+      "min_float": 0.0,
+      "max_float": 0.1,
+      "stattrak_supported": false
+    },
+    {
+      "id": "awp-dragon-lore",
+      "name": "AWP | Dragon Lore",
+      "collection_id": "cobblestone",
+      "collection_name": "The Cobblestone Collection",
+      "rarity": "covert",
+      "min_float": 0.0,
+      "max_float": 0.7,
+      "stattrak_supported": false
+    },
+    {
+      "id": "ak47-cartel",
+      "name": "AK-47 | Cartel",
+      "collection_id": "chroma",
+      "collection_name": "The Chroma Collection",
+      "rarity": "classified",
+      "min_float": 0.0,
+      "max_float": 0.75,
+      "stattrak_supported": true
+    },
+    {
+      "id": "m4a4-dragon-king",
+      "name": "M4A4 | 龍王 (Dragon King)",
+      "collection_id": "chroma",
+      "collection_name": "The Chroma Collection",
+      "rarity": "classified",
+      "min_float": 0.0,
+      "max_float": 0.75,
+      "stattrak_supported": true
+    },
+    {
+      "id": "p250-muertos",
+      "name": "P250 | Muertos",
+      "collection_id": "chroma",
+      "collection_name": "The Chroma Collection",
+      "rarity": "classified",
+      "min_float": 0.0,
+      "max_float": 0.6,
+      "stattrak_supported": true
+    },
+    {
+      "id": "awp-mano-war",
+      "name": "AWP | Man-o'-war",
+      "collection_id": "chroma",
+      "collection_name": "The Chroma Collection",
+      "rarity": "covert",
+      "min_float": 0.1,
+      "max_float": 0.2,
+      "stattrak_supported": true
+    },
+    {
+      "id": "galil-chatterbox",
+      "name": "Galil AR | Chatterbox",
+      "collection_id": "chroma",
+      "collection_name": "The Chroma Collection",
+      "rarity": "covert",
+      "min_float": 0.35,
+      "max_float": 0.85,
+      "stattrak_supported": true
+    }
+  ],
+  "fixture_listings": [
+    {"id": "fixture-knight-01", "skin_id": "m4a1s-knight", "float_value": 0.02140000, "price_cents": 524900, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-02", "skin_id": "m4a1s-knight", "float_value": 0.02140500, "price_cents": 524300, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-03", "skin_id": "m4a1s-knight", "float_value": 0.02141000, "price_cents": 523800, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-04", "skin_id": "m4a1s-knight", "float_value": 0.02141500, "price_cents": 523100, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-05", "skin_id": "m4a1s-knight", "float_value": 0.02142000, "price_cents": 522700, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-06", "skin_id": "m4a1s-knight", "float_value": 0.02142500, "price_cents": 522300, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-07", "skin_id": "m4a1s-knight", "float_value": 0.02143000, "price_cents": 522100, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-08", "skin_id": "m4a1s-knight", "float_value": 0.02143500, "price_cents": 521900, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-09", "skin_id": "m4a1s-knight", "float_value": 0.02144000, "price_cents": 521700, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-10", "skin_id": "m4a1s-knight", "float_value": 0.02144500, "price_cents": 521500, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-11", "skin_id": "m4a1s-knight", "float_value": 0.02145000, "price_cents": 523500, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-knight-12", "skin_id": "m4a1s-knight", "float_value": 0.02145500, "price_cents": 524500, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A1-S%20Knight", "source": "fixture"},
+    {"id": "fixture-cartel-01", "skin_id": "ak47-cartel", "float_value": 0.10000000, "price_cents": 1750, "market_url": "https://steamcommunity.com/market/search?appid=730&q=AK-47%20Cartel", "source": "fixture"},
+    {"id": "fixture-cartel-02", "skin_id": "ak47-cartel", "float_value": 0.18000000, "price_cents": 1680, "market_url": "https://steamcommunity.com/market/search?appid=730&q=AK-47%20Cartel", "source": "fixture"},
+    {"id": "fixture-cartel-03", "skin_id": "ak47-cartel", "float_value": 0.25000000, "price_cents": 1710, "market_url": "https://steamcommunity.com/market/search?appid=730&q=AK-47%20Cartel", "source": "fixture"},
+    {"id": "fixture-cartel-04", "skin_id": "ak47-cartel", "float_value": 0.32000000, "price_cents": 1790, "market_url": "https://steamcommunity.com/market/search?appid=730&q=AK-47%20Cartel", "source": "fixture"},
+    {"id": "fixture-dragonking-01", "skin_id": "m4a4-dragon-king", "float_value": 0.12000000, "price_cents": 1650, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A4%20Dragon%20King", "source": "fixture"},
+    {"id": "fixture-dragonking-02", "skin_id": "m4a4-dragon-king", "float_value": 0.20000000, "price_cents": 1620, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A4%20Dragon%20King", "source": "fixture"},
+    {"id": "fixture-dragonking-03", "skin_id": "m4a4-dragon-king", "float_value": 0.30000000, "price_cents": 1710, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A4%20Dragon%20King", "source": "fixture"},
+    {"id": "fixture-dragonking-04", "skin_id": "m4a4-dragon-king", "float_value": 0.42000000, "price_cents": 1850, "market_url": "https://steamcommunity.com/market/search?appid=730&q=M4A4%20Dragon%20King", "source": "fixture"},
+    {"id": "fixture-muertos-01", "skin_id": "p250-muertos", "float_value": 0.08000000, "price_cents": 880, "market_url": "https://steamcommunity.com/market/search?appid=730&q=P250%20Muertos", "source": "fixture"},
+    {"id": "fixture-muertos-02", "skin_id": "p250-muertos", "float_value": 0.16000000, "price_cents": 840, "market_url": "https://steamcommunity.com/market/search?appid=730&q=P250%20Muertos", "source": "fixture"},
+    {"id": "fixture-muertos-03", "skin_id": "p250-muertos", "float_value": 0.26000000, "price_cents": 920, "market_url": "https://steamcommunity.com/market/search?appid=730&q=P250%20Muertos", "source": "fixture"},
+    {"id": "fixture-muertos-04", "skin_id": "p250-muertos", "float_value": 0.38000000, "price_cents": 1120, "market_url": "https://steamcommunity.com/market/search?appid=730&q=P250%20Muertos", "source": "fixture"}
+  ]
+}
