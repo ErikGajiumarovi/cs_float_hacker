@@ -1,0 +1,6 @@
+[package]
+name = "cs_float_hacker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
