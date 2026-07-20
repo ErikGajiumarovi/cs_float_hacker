@@ -9,6 +9,8 @@ use reqwest::{Client, header::USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::RwLock, time::interval};
 
+use crate::catalog::Catalog;
+
 const BYMYKEL_REPO: &str = "ByMykel/CSGO-API";
 const STEAMTRACKING_REPO: &str = "SteamTracking/GameTracking-CS2";
 
@@ -63,6 +65,7 @@ pub struct SyncService {
     client: Client,
     data_dir: PathBuf,
     state: Arc<RwLock<SyncStatus>>,
+    catalog: Arc<RwLock<Catalog>>,
     interval_seconds: u64,
 }
 
@@ -79,7 +82,7 @@ struct UpstreamSkin {
 }
 
 impl SyncService {
-    pub fn from_environment() -> Result<Self, String> {
+    pub fn from_environment(catalog: Arc<RwLock<Catalog>>) -> Result<Self, String> {
         let data_dir = std::env::var("SYNC_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("runtime"));
@@ -104,6 +107,7 @@ impl SyncService {
             client,
             data_dir,
             state,
+            catalog,
             interval_seconds,
         })
     }
@@ -144,6 +148,7 @@ impl SyncService {
         state.running = false;
         match result {
             Ok(result) => {
+                *self.catalog.write().await = result.catalog;
                 state.last_success_at = Some(now_epoch());
                 state.bymykel_commit = Some(result.bymykel_commit);
                 state.steamtracking_commit = Some(result.steamtracking_commit);
@@ -182,6 +187,8 @@ impl SyncService {
             std::str::from_utf8(&items_game).map_err(|error| error.to_string())?,
         );
         let verification = verify_caps(&upstream_skins, &valve_caps);
+        let catalog =
+            Catalog::from_upstream_snapshot(&skins, &bymykel_commit, now_epoch().to_string())?;
 
         let snapshot_dir = self.data_dir.join("catalog").join(&bymykel_commit);
         fs::create_dir_all(&snapshot_dir)
@@ -212,6 +219,7 @@ impl SyncService {
         )
         .await
         .map_err(|error| error.to_string())?;
+        catalog.store_runtime(&self.data_dir)?;
 
         Ok(SyncResult {
             bymykel_commit,
@@ -219,6 +227,7 @@ impl SyncService {
             imported_skins: upstream_skins.len(),
             imported_collections: imported_collections.len(),
             verification,
+            catalog,
         })
     }
 
@@ -269,6 +278,7 @@ struct SyncResult {
     imported_skins: usize,
     imported_collections: usize,
     verification: CapsVerification,
+    catalog: Catalog,
 }
 
 fn now_epoch() -> u64 {

@@ -25,9 +25,11 @@ weapon/paint index и membership в коллекциях. `collections.json` з�
 ```
 
 Скрипт только скачивает pinned JSON, не перезаписывая проверенный subset.
-Полный importer должен использовать составной ключ `(weapon def_index,
-paint_index)`, а не один `paint_index`: один paint kit допустим у нескольких
-видов оружия.
+Runtime importer materialize-ит запись для каждого membership `collection ×
+skin` и использует id `collection_id/upstream_skin_id`. Это сохраняет outcome
+pools даже если один skin принадлежит нескольким коллекциям. `paint_index`
+используется только для независимой Valve-сверки caps, а не как ключ trade-up
+path.
 
 ## Что такое «absolute float»
 
@@ -49,8 +51,19 @@ raw      = f32(skin_min + adjusted * (skin_max - skin_min))
 `wear_remap_min` и `wear_remap_max`. Его следует применять для QA/diff
 нового snapshot, но не вендорить: это не OSS-лицензированный каталог.
 
-Для inspect links ориентир — MIT-проект
-[csfloat/cs-inspect-serializer](https://github.com/csfloat/cs-inspect-serializer):
-современный payload содержит `paintwear` как `u32` bits f32. Это планируемый
-следующий адаптер для owned items; текущий MVP честно принимает exact float
-вручную.
+## Steam Community Market listings
+
+[Steam Community Market](https://steamcommunity.com/market/) — единственный
+источник покупаемых лотов в live provider. Он не использует CSFloat API и не
+передаёт Steam cookie. Provider читает публичную SSR HTML-страницу
+`/market/listings/730/<market_hash_name>` в USD, где текущий Market помещает
+список лотов в `window.SSR.renderContext`.
+
+Для каждого принятого лота provider сверяет `market_hash_name`, берёт exact
+raw float из asset property `propertyid: 2`, собирает inspect URI подстановкой
+asset property `propertyid: 6` в `market_actions`, а цену покупателя считает
+как `unPrice + unFee`. Разметка не является стабильным публичным API: parser
+должен падать явно при её изменении, а не возвращать неподтверждённые данные.
+
+Для собственных предметов отдельный inspect-link decoder пока не подключён;
+exact float вводится пользователем и проходит валидацию against caps.

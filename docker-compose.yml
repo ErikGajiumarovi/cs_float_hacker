@@ -7,6 +7,10 @@ services:
     environment:
       SYNC_DATA_DIR: /app/runtime
       CATALOG_SYNC_INTERVAL_SECS: 86400
+      MARKET_PROVIDER: ${MARKET_PROVIDER:-steam}
+      STEAM_MARKET_BASE_URL: ${STEAM_MARKET_BASE_URL:-https://steamcommunity.com/market/listings/730/}
+      MARKET_CACHE_TTL_SECS: ${MARKET_CACHE_TTL_SECS:-60}
+      STEAM_MARKET_MIN_REQUEST_INTERVAL_MS: ${STEAM_MARKET_MIN_REQUEST_INTERVAL_MS:-1000}
     volumes:
       - ./runtime:/app/runtime
 

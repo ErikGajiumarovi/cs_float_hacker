@@ -66,6 +66,10 @@ pub struct Skin {
     pub min_float: f32,
     pub max_float: f32,
     pub stattrak_supported: bool,
+    #[serde(default)]
+    pub def_index: Option<u32>,
+    #[serde(default)]
+    pub paint_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +80,8 @@ pub struct FixtureListing {
     pub price_cents: u64,
     pub market_url: String,
     pub source: String,
+    #[serde(default)]
+    pub inspect_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -482,6 +488,7 @@ pub struct PlannedListing {
     pub adjusted_float: Float32Value,
     pub price_cents: Option<u64>,
     pub market_url: Option<String>,
+    pub inspect_link: Option<String>,
     pub owned: bool,
 }
 
@@ -497,6 +504,7 @@ pub struct PlanResponse {
     pub candidate_input_skins: Vec<Skin>,
     pub selected_inputs: Vec<PlannedListing>,
     pub total_price_cents: u64,
+    pub pricing_available: bool,
     pub predicted_target_float: Float32Value,
     pub target_distance: Float32Value,
     pub target_wear: WearInfo,
@@ -519,6 +527,15 @@ struct ChosenPlan<'a> {
     total_price_cents: u64,
     within_target: bool,
     distance: f32,
+}
+
+const BEAM_WIDTH: usize = 4_096;
+
+#[derive(Debug, Clone)]
+struct BeamState<'a> {
+    candidates: Vec<&'a Candidate<'a>>,
+    adjusted_sum: f32,
+    total_price_cents: u64,
 }
 
 fn better_choice(
@@ -613,6 +630,118 @@ fn search_combinations<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn search_combinations_beam<'a>(
+    candidates: &'a [Candidate<'a>],
+    owned: &[ResolvedInput<'a>],
+    required: usize,
+    target: &'a Skin,
+    target_adjusted: f32,
+    acceptable_low: f32,
+    acceptable_high: f32,
+    target_center: f32,
+    budget_cents: Option<u64>,
+    priority: &PlanningPriority,
+) -> Option<ChosenPlan<'a>> {
+    let owned_sum = owned.iter().fold(0.0_f32, |sum, input| {
+        f32_add(
+            sum,
+            adjusted_float(input.float_value, input.skin).expect("validated owned item"),
+        )
+    });
+    let desired_missing_sum = f32_sub(f32_mul(target_adjusted, 10.0), owned_sum);
+    let mut levels = (0..=required)
+        .map(|_| Vec::<BeamState<'a>>::new())
+        .collect::<Vec<_>>();
+    levels[0].push(BeamState {
+        candidates: Vec::new(),
+        adjusted_sum: 0.0,
+        total_price_cents: 0,
+    });
+
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        let maximum_count = required.min(candidate_index + 1);
+        for count in (1..=maximum_count).rev() {
+            let additions = levels[count - 1]
+                .iter()
+                .filter_map(|state| {
+                    let total_price_cents = state
+                        .total_price_cents
+                        .checked_add(candidate.listing.price_cents)?;
+                    if budget_cents.is_some_and(|budget| total_price_cents > budget) {
+                        return None;
+                    }
+                    let mut chosen = state.candidates.clone();
+                    chosen.push(candidate);
+                    Some(BeamState {
+                        candidates: chosen,
+                        adjusted_sum: f32_add(state.adjusted_sum, candidate.adjusted),
+                        total_price_cents,
+                    })
+                })
+                .collect::<Vec<_>>();
+            levels[count].extend(additions);
+            prune_beam_level(&mut levels[count], count, required, desired_missing_sum);
+        }
+    }
+
+    let mut best = None;
+    for state in &levels[required] {
+        let average = average_adjusted(
+            owned
+                .iter()
+                .map(|input| {
+                    adjusted_float(input.float_value, input.skin).expect("validated owned item")
+                })
+                .chain(state.candidates.iter().map(|candidate| candidate.adjusted)),
+            10,
+        );
+        let predicted = output_float(average, target);
+        let candidate = ChosenPlan {
+            candidates: state.candidates.clone(),
+            predicted,
+            total_price_cents: state.total_price_cents,
+            within_target: predicted >= acceptable_low && predicted <= acceptable_high,
+            distance: f32_abs(f32_sub(predicted, target_center)),
+        };
+        if better_choice(&candidate, best.as_ref(), priority) {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn prune_beam_level(
+    level: &mut Vec<BeamState<'_>>,
+    count: usize,
+    required: usize,
+    desired_missing_sum: f32,
+) {
+    if level.len() <= BEAM_WIDTH {
+        return;
+    }
+    let expected_partial_sum = f32_mul(desired_missing_sum, f32_div(count as f32, required as f32));
+    level.sort_by(|left, right| {
+        let left_distance = f32_abs(f32_sub(left.adjusted_sum, expected_partial_sum));
+        let right_distance = f32_abs(f32_sub(right.adjusted_sum, expected_partial_sum));
+        left_distance
+            .total_cmp(&right_distance)
+            .then_with(|| left.total_price_cents.cmp(&right.total_price_cents))
+            .then_with(|| {
+                left.candidates
+                    .iter()
+                    .map(|candidate| candidate.listing.id.as_str())
+                    .cmp(
+                        right
+                            .candidates
+                            .iter()
+                            .map(|candidate| candidate.listing.id.as_str()),
+                    )
+            })
+    });
+    level.truncate(BEAM_WIDTH);
+}
+
 pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanResponse, PlannerError> {
     let target = catalog.skin(&request.target_skin_id).ok_or_else(|| {
         PlannerError::Validation(format!(
@@ -665,6 +794,9 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
         ));
     }
     let required = 10 - owned.len();
+    // The limit is per input skin: a marketplace provider may deliberately
+    // collect a broad pool for every valid trade-up path.  Applying this as a
+    // global cap would silently discard all but the cheapest skin's candidates.
     let listing_limit = request.listing_limit.unwrap_or(200).clamp(1, 200);
     let raw_listings = catalog.fixture_listings_for_skins(&valid_input_ids, listing_limit);
     let candidates = raw_listings
@@ -681,6 +813,19 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
             })
         })
         .collect::<Vec<_>>();
+    if candidates.is_empty() && required > 0 {
+        return ideal_reverse_plan(
+            catalog,
+            &request,
+            target,
+            &candidate_input_skins,
+            &owned,
+            target_adjusted,
+            acceptable_low,
+            acceptable_high,
+            target_center,
+        );
+    }
     if required > candidates.len() {
         return Err(PlannerError::Validation(format!(
             "only {} usable fixture listings are available for {} missing slots",
@@ -688,28 +833,48 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
             required
         )));
     }
-    if candidates.len() > 28 {
-        return Err(PlannerError::Validation(
-            "the exact MVP optimizer is deliberately capped at 28 fixture candidates; a live 200-listing optimizer is the next adapter".to_owned(),
-        ));
-    }
-
-    let mut selected = Vec::with_capacity(required);
-    let mut best = None;
-    search_combinations(
-        &candidates,
-        &owned,
-        required,
-        target,
-        acceptable_low,
-        acceptable_high,
-        target_center,
-        request.budget_cents,
-        &request.priority,
-        0,
-        &mut selected,
-        &mut best,
-    );
+    let (best, optimizer) = if candidates.len() <= 28 {
+        let mut selected = Vec::with_capacity(required);
+        let mut best = None;
+        search_combinations(
+            &candidates,
+            &owned,
+            required,
+            target,
+            acceptable_low,
+            acceptable_high,
+            target_center,
+            request.budget_cents,
+            &request.priority,
+            0,
+            &mut selected,
+            &mut best,
+        );
+        (
+            best,
+            "exact combination enumeration over the available listing pool".to_owned(),
+        )
+    } else {
+        (
+            search_combinations_beam(
+                &candidates,
+                &owned,
+                required,
+                target,
+                target_adjusted,
+                acceptable_low,
+                acceptable_high,
+                target_center,
+                request.budget_cents,
+                &request.priority,
+            ),
+            format!(
+                "bounded beam search over {} listings (beam width {})",
+                candidates.len(),
+                BEAM_WIDTH
+            ),
+        )
+    };
     let Some(best) = best else {
         return Err(PlannerError::Validation(
             "no candidate combination is within the supplied budget".to_owned(),
@@ -758,13 +923,21 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
     } else {
         "closest"
     };
+    let uses_steam_market = best
+        .candidates
+        .iter()
+        .all(|candidate| candidate.listing.source == "steam_community_market");
     let message = match status {
         "exact" => "Найден bit-exact float32 результат для выбранной цели.".to_owned(),
         "within_tolerance" => {
-            "Найден самый дешёвый набор fixture-лотов в допустимом диапазоне.".to_owned()
+            if uses_steam_market {
+                "Найден набор активных лотов Steam Community Market в допустимом диапазоне."
+                    .to_owned()
+            } else {
+                "Найден самый дешёвый набор доступных лотов в допустимом диапазоне.".to_owned()
+            }
         }
-        _ => "Набора в допустимом диапазоне нет; показан ближайший из доступных fixture-лотов."
-            .to_owned(),
+        _ => "Набора в допустимом диапазоне нет; показан ближайший из доступных лотов.".to_owned(),
     };
 
     let owned_listings = owned
@@ -782,6 +955,7 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
             ),
             price_cents: None,
             market_url: None,
+            inspect_link: None,
             owned: true,
         });
     let fixture_listings = best
@@ -798,6 +972,7 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
             adjusted_float: Float32Value::new(candidate.adjusted),
             price_cents: Some(candidate.listing.price_cents),
             market_url: Some(candidate.listing.market_url.clone()),
+            inspect_link: candidate.listing.inspect_link.clone(),
             owned: false,
         });
 
@@ -815,15 +990,148 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
         candidate_input_skins: candidate_input_skins.into_iter().cloned().collect(),
         selected_inputs: owned_listings.chain(fixture_listings).collect(),
         total_price_cents: best.total_price_cents,
+        pricing_available: true,
         predicted_target_float: Float32Value::new(best.predicted),
         target_distance: Float32Value::new(best.distance),
         target_wear: target_outcome.wear.clone(),
         all_outcomes: analysis.outcomes,
-        optimizer: "exact combination enumeration over the current fixture candidate pool".to_owned(),
-        warnings: vec![
-            "fixture означает, что это детерминированный тестовый лот, а не проверяемое объявление Steam Market.".to_owned(),
-            "В production вместо fixture provider нужен auth/browser-backed market adapter и local inspect-link decoder.".to_owned(),
+        optimizer,
+        warnings: [
+            if uses_steam_market {
+                "Steam Community Market listing содержит цену покупателя с комиссией, ссылку на Market, inspect link и exact raw float на момент чтения HTML; перед покупкой проверьте актуальный статус лота."
+                    .to_owned()
+            } else {
+                "fixture означает, что это детерминированный тестовый лот, а не проверяемое объявление Steam Market.".to_owned()
+            },
             "delta применяется как допустимое отклонение результата от цели; формула и все промежуточные операции — float32.".to_owned(),
+        ]
+        .into(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ideal_reverse_plan(
+    catalog: &Catalog,
+    request: &PlanRequest,
+    target: &Skin,
+    candidate_input_skins: &[&Skin],
+    owned: &[ResolvedInput<'_>],
+    target_adjusted: f32,
+    acceptable_low: f32,
+    acceptable_high: f32,
+    target_center: f32,
+) -> Result<PlanResponse, PlannerError> {
+    let required = 10 - owned.len();
+    let input_skin = candidate_input_skins
+        .iter()
+        .copied()
+        .find(|skin| !request.stattrak || skin.stattrak_supported)
+        .ok_or_else(|| {
+            PlannerError::Validation("no StatTrak-compatible inputs exist for this path".to_owned())
+        })?;
+    let owned_sum = owned.iter().fold(0.0_f32, |sum, input| {
+        f32_add(
+            sum,
+            adjusted_float(input.float_value, input.skin).expect("validated owned item"),
+        )
+    });
+    let ideal_adjusted = f32_div(
+        f32_sub(f32_mul(target_adjusted, 10.0), owned_sum),
+        required as f32,
+    );
+    let bounded_adjusted = ideal_adjusted.clamp(0.0, 1.0);
+    let ideal_float = output_float(bounded_adjusted, input_skin);
+    let mut resolved_inputs = request.owned_inputs.clone();
+    resolved_inputs.extend((0..required).map(|_| InputRequest {
+        skin_id: input_skin.id.clone(),
+        float_value: ideal_float,
+        inspect_link: None,
+    }));
+    let analysis = analyze_contract(
+        catalog,
+        AnalyzeRequest {
+            contract_size: 10,
+            stattrak: request.stattrak,
+            inputs: resolved_inputs,
+        },
+    )?;
+    let target_outcome = analysis
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.skin_id == target.id)
+        .ok_or_else(|| {
+            PlannerError::Catalog("target missing from its own contract outcomes".to_owned())
+        })?;
+    let predicted = target_outcome.predicted_float.value;
+    let within_target = predicted >= acceptable_low && predicted <= acceptable_high;
+    let status = if within_target {
+        match request.target {
+            TargetConstraint::Exact { value } if predicted.to_bits() == value.to_bits() => "exact",
+            _ => "within_tolerance",
+        }
+    } else {
+        "closest"
+    };
+    let owned_listings = owned
+        .iter()
+        .enumerate()
+        .map(|(index, input)| PlannedListing {
+            slot: index + 1,
+            listing_id: None,
+            source: "owned".to_owned(),
+            skin_id: input.skin.id.clone(),
+            skin_name: input.skin.name.clone(),
+            float_value: Float32Value::new(input.float_value),
+            adjusted_float: Float32Value::new(
+                adjusted_float(input.float_value, input.skin).expect("validated"),
+            ),
+            price_cents: None,
+            market_url: None,
+            inspect_link: None,
+            owned: true,
+        });
+    let generated_listings = (0..required).map(|index| PlannedListing {
+        slot: owned.len() + index + 1,
+        listing_id: None,
+        source: "ideal_math".to_owned(),
+        skin_id: input_skin.id.clone(),
+        skin_name: input_skin.name.clone(),
+        float_value: Float32Value::new(ideal_float),
+        adjusted_float: Float32Value::new(bounded_adjusted),
+        price_cents: None,
+        market_url: None,
+        inspect_link: None,
+        owned: false,
+    });
+
+    Ok(PlanResponse {
+        status: status.to_owned(),
+        message: if within_target {
+            "Построен идеальный математический контракт; реальные лоты для его покупки ещё не подключены.".to_owned()
+        } else {
+            "С текущими owned-предметами цель недостижима: показан ближайший математический контракт.".to_owned()
+        },
+        target_skin: target.clone(),
+        target_adjusted: Float32Value::new(target_adjusted),
+        acceptable_output_range: [
+            Float32Value::new(acceptable_low),
+            Float32Value::new(acceptable_high),
+        ],
+        contract_size: 10,
+        target_probability: target_outcome.probability_percent.clone(),
+        candidate_input_skins: candidate_input_skins.iter().map(|skin| (*skin).clone()).collect(),
+        selected_inputs: owned_listings.chain(generated_listings).collect(),
+        total_price_cents: 0,
+        pricing_available: false,
+        predicted_target_float: Float32Value::new(predicted),
+        target_distance: Float32Value::new(f32_abs(f32_sub(predicted, target_center))),
+        target_wear: target_outcome.wear.clone(),
+        all_outcomes: analysis.outcomes,
+        optimizer: "analytical float32 construction; no purchasable listing provider is configured".to_owned(),
+        warnings: vec![
+            "Слоты ideal_math задают требуемые exact float, а не существующие рыночные предметы.".to_owned(),
+            "Подключите provider, который возвращает конкретный listing, inspect payload и exact float, чтобы оптимизировать цену и выдать ссылки на покупку.".to_owned(),
+            "delta применяется к результату; все промежуточные операции выполняются как последовательные float32.".to_owned(),
         ],
     })
 }
@@ -860,6 +1168,8 @@ mod tests {
             min_float: 0.0,
             max_float: 0.8,
             stattrak_supported: false,
+            def_index: None,
+            paint_index: None,
         };
         let out_skin = Skin {
             max_float: 0.8,
@@ -961,5 +1271,77 @@ mod tests {
         );
         assert_eq!(plan.status, "within_tolerance");
         assert_eq!(plan.target_probability, "100.00%");
+    }
+
+    #[test]
+    fn full_catalog_without_listings_returns_an_ideal_math_contract() {
+        let snapshot = br#"[
+          {"id":"classified","name":"Input","min_float":0.0,"max_float":1.0,"rarity":{"id":"rarity_legendary_weapon"},"stattrak":true,"collections":[{"id":"collection-test","name":"Test"}]},
+          {"id":"covert","name":"Target","min_float":0.06,"max_float":0.8,"rarity":{"id":"rarity_ancient_weapon"},"stattrak":true,"collections":[{"id":"collection-test","name":"Test"}]}
+        ]"#;
+        let catalog = Catalog::from_upstream_snapshot(snapshot, "test", "now".to_owned()).unwrap();
+        let plan = plan_reverse(
+            &catalog,
+            PlanRequest {
+                target_skin_id: "collection-test/covert".into(),
+                target: TargetConstraint::Exact { value: 0.15 },
+                delta: 0.0001,
+                stattrak: false,
+                owned_inputs: Vec::new(),
+                budget_cents: None,
+                priority: PlanningPriority::Cheapest,
+                listing_limit: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            plan.selected_inputs
+                .iter()
+                .all(|input| input.source == "ideal_math")
+        );
+        assert!(!plan.pricing_available);
+        assert_eq!(plan.status, "exact");
+    }
+
+    #[test]
+    fn large_listing_pool_uses_combination_search_without_reusing_listings() {
+        let catalog = Catalog::load_embedded().unwrap();
+        let listings = (0..200)
+            .map(|index| FixtureListing {
+                id: format!("live-{index}"),
+                skin_id: "m4a1s-knight".to_owned(),
+                float_value: 0.021_25 + index as f32 * 0.000_01,
+                price_cents: 10_000 + index,
+                market_url: format!("https://example.test/item/{index}"),
+                source: "steam_community_market".to_owned(),
+                inspect_link: Some(format!("steam://inspect/{index}")),
+            })
+            .collect();
+        let catalog = catalog.with_listings(listings);
+        let plan = plan_reverse(
+            &catalog,
+            PlanRequest {
+                target_skin_id: "awp-dragon-lore".to_owned(),
+                target: TargetConstraint::Exact { value: 0.15 },
+                delta: 0.0001,
+                stattrak: false,
+                owned_inputs: Vec::new(),
+                budget_cents: None,
+                priority: PlanningPriority::Cheapest,
+                listing_limit: Some(200),
+            },
+        )
+        .unwrap();
+        let listing_ids = plan
+            .selected_inputs
+            .iter()
+            .filter_map(|input| input.listing_id.as_ref())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(plan.optimizer.starts_with("bounded beam search"));
+        assert_eq!(plan.selected_inputs.len(), 10);
+        assert_eq!(listing_ids.len(), 10);
+        assert!(plan.pricing_available);
     }
 }

@@ -31,7 +31,7 @@ type Catalog = {
   schema_version: string
   source: { name: string; url: string; license: string; retrieved_at: string; note: string }
   skins: Skin[]
-  fixture_listing_count: number
+  listing_count: number
   limitations: string[]
 }
 
@@ -44,6 +44,15 @@ type SyncStatus = {
   caps_verification: { compared: number; matching: number; mismatching: number; not_directly_verifiable: number } | null
 }
 
+type MarketStatus = {
+  provider: string
+  enabled: boolean
+  cache_ttl_seconds: number
+  minimum_request_interval_ms: number
+  cached_searches: number
+  max_candidates_per_skin: number
+}
+
 type PlannedInput = {
   slot: number
   listing_id: string | null
@@ -54,6 +63,7 @@ type PlannedInput = {
   adjusted_float: Float32
   price_cents: number | null
   market_url: string | null
+  inspect_link: string | null
   owned: boolean
 }
 
@@ -68,6 +78,7 @@ type Plan = {
   candidate_input_skins: Skin[]
   selected_inputs: PlannedInput[]
   total_price_cents: number
+  pricing_available: boolean
   predicted_target_float: Float32
   target_distance: Float32
   target_wear: Wear
@@ -142,6 +153,7 @@ function OutcomeTable({ outcomes }: { outcomes: Outcome[] }) {
 export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null)
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
+  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null)
   const [targetSkinId, setTargetSkinId] = useState('')
   const [targetMode, setTargetMode] = useState<TargetMode>('exact')
   const [targetValue, setTargetValue] = useState('0.150000')
@@ -173,6 +185,13 @@ export default function App() {
       })
       .catch(problem => setError(`Не удалось загрузить API: ${problem.message}`))
       .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/market-status`)
+      .then(response => response.ok ? response.json() as Promise<MarketStatus> : null)
+      .then(status => { if (status) setMarketStatus(status) })
+      .catch(() => undefined)
   }, [])
 
   useEffect(() => {
@@ -277,8 +296,9 @@ export default function App() {
     </header>
 
     <section className="container notice">
-      <strong>Работающий срез:</strong> Cobblestone / Chroma caps, normal 10-item contract, reverse-подбор, уже имеющиеся предметы и точный fixture-оптимизатор. Лоты ниже — тестовые, не live Steam Market.
+      <strong>Каталог и математика:</strong> после успешной синхронизации планировщик переключается на полный versioned snapshot ByMykel. Лоты появляются только через provider с подтверждённым exact float; встроенный MVP-пул остаётся тестовым fallback.
       {syncStatus && <span className="sync-line">Catalog sync: {syncStatus.running ? 'обновление…' : syncStatus.last_error ? `ошибка — ${syncStatus.last_error}` : syncStatus.last_success_at ? `${syncStatus.imported_skins} skins / ${syncStatus.imported_collections} collections; direct caps: ${syncStatus.caps_verification?.matching ?? 0} match, ${syncStatus.caps_verification?.mismatching ?? 0} mismatch, ${syncStatus.caps_verification?.not_directly_verifiable ?? 0} review` : 'ожидание первого обновления'}</span>}
+      {marketStatus && <span className="sync-line">Market: {marketStatus.enabled ? `${marketStatus.provider}, cache ${marketStatus.cache_ttl_seconds}s, ≤${marketStatus.max_candidates_per_skin} candidates/skin` : 'provider не настроен — будет показан ideal_math'}</span>}
     </section>
 
     {error && <section className="container error"><strong>Расчёт остановлен:</strong> {error}</section>}
@@ -354,7 +374,7 @@ export default function App() {
         <div className="metric"><span>Target adjusted</span><strong><FloatValue value={plan.target_adjusted} /></strong><small>нужно среднее</small></div>
         <div className="metric"><span>Прогноз target float</span><strong><FloatValue value={plan.predicted_target_float} /></strong><small>{plan.target_wear.name}</small></div>
         <div className="metric"><span>Шанс названия</span><strong>{plan.target_probability}</strong><small>не зависит от float</small></div>
-        <div className="metric"><span>Цена недостающих</span><strong>{money(plan.total_price_cents)}</strong><small>fixture snapshot</small></div>
+        <div className="metric"><span>Цена недостающих</span><strong>{plan.pricing_available ? money(plan.total_price_cents) : '—'}</strong><small>{plan.pricing_available ? 'проверенные кандидаты' : 'лоты не подключены'}</small></div>
       </div>
 
       <div className="card result-card">
@@ -367,7 +387,7 @@ export default function App() {
             <td><FloatValue value={input.float_value} bits /></td>
             <td><FloatValue value={input.adjusted_float} /></td>
             <td>{input.owned ? 'ваш предмет' : money(input.price_cents)}</td>
-            <td>{input.market_url ? <a href={input.market_url} target="_blank" rel="noreferrer">{input.source} ↗</a> : input.source}</td>
+            <td>{input.market_url ? <><a href={input.market_url} target="_blank" rel="noreferrer">{input.source} ↗</a>{input.inspect_link && <> · <a href={input.inspect_link}>inspect ↗</a></>}</> : input.source}</td>
           </tr>)}</tbody>
         </table></div>
       </div>
@@ -385,7 +405,7 @@ export default function App() {
       {simulation && <div className="simulation-output"><div className="average">avg adjusted: <FloatValue value={simulation.average_adjusted} bits /></div><OutcomeTable outcomes={simulation.outcomes} /><Warnings messages={simulation.warnings} /></div>}
     </section>
 
-    <section className="container limitations card"><p className="eyebrow">scope of this MVP</p><h2>Что намеренно ещё не имитируется</h2><ul>{catalog?.limitations.map(item => <li key={item}>{item}</li>)}</ul><p>Следующий безопасный слой: pinned full catalog importer, local CSFloat inspect-link decoder, а затем авторизованный/браузерный provider реальных лотов с cache и rate limits.</p></section>
+    <section className="container limitations card"><p className="eyebrow">границы данных</p><h2>Что требует внешнего источника</h2><ul>{catalog?.limitations.map(item => <li key={item}>{item}</li>)}</ul><p>Полный catalog, float32-расчёт и reverse path работают локально. Для конкретных покупок всё ещё необходим provider, который законно отдаёт listing, inspect payload и exact float.</p></section>
     <footer className="container footer">Floatcraft MVP · Rust API + React/TypeScript · catalog snapshot {catalog?.schema_version}</footer>
   </main>
 }
