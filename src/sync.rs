@@ -7,7 +7,7 @@ use std::{
 
 use reqwest::{Client, header::USER_AGENT};
 use serde::{Deserialize, Serialize};
-use tokio::{fs, sync::RwLock, time::interval};
+use tokio::{fs, sync::RwLock, time::sleep};
 
 use crate::catalog::Catalog;
 
@@ -86,6 +86,12 @@ impl SyncService {
         let data_dir = std::env::var("SYNC_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("runtime"));
+        Self::from_data_dir(catalog, data_dir)
+    }
+
+    /// Builds the service with an explicit data directory. Desktop callers use
+    /// the operating system's app-data directory instead of a relative path.
+    pub fn from_data_dir(catalog: Arc<RwLock<Catalog>>, data_dir: PathBuf) -> Result<Self, String> {
         let interval_seconds = std::env::var("CATALOG_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -117,19 +123,40 @@ impl SyncService {
     }
 
     pub fn start(self: Arc<Self>) {
-        tokio::spawn(async move {
-            let enabled = self.state.read().await.enabled;
-            if !enabled {
-                return;
-            }
+        tokio::spawn(self.run());
+    }
+
+    /// Runs on the caller's async runtime so desktop embedding does not depend
+    /// on an HTTP server having created a Tokio reactor first.
+    pub async fn run(self: Arc<Self>) {
+        let enabled = self.state.read().await.enabled;
+        if !enabled {
+            return;
+        }
+        let mut consecutive_failures = 0_u32;
+        loop {
             self.sync_now().await;
-            let mut ticker = interval(Duration::from_secs(self.interval_seconds));
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                self.sync_now().await;
-            }
-        });
+            let failed = self.state.read().await.last_error.is_some();
+            consecutive_failures = if failed {
+                consecutive_failures.saturating_add(1)
+            } else {
+                0
+            };
+            // A network outage must not turn every desktop launch into a
+            // retry storm. The successful cadence stays at 24h by default;
+            // failures retry at 1m, 5m, 30m, then cap at one hour.
+            let delay = if failed {
+                match consecutive_failures {
+                    1 => Duration::from_secs(60),
+                    2 => Duration::from_secs(5 * 60),
+                    3 => Duration::from_secs(30 * 60),
+                    _ => Duration::from_secs(60 * 60),
+                }
+            } else {
+                Duration::from_secs(self.interval_seconds)
+            };
+            sleep(delay).await;
+        }
     }
 
     pub async fn sync_now(&self) {

@@ -2,6 +2,10 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
+
 const inputSkin = {
   id: 'collection-test/input',
   name: 'Input',
@@ -58,31 +62,25 @@ const analysis = {
   warnings: [],
 }
 
-function response(payload: unknown) {
-  return Promise.resolve(new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } }))
-}
-
 afterEach(() => {
-  vi.unstubAllGlobals()
+  invokeMock.mockReset()
 })
 
 describe('regression collector', () => {
   it('previews a complete contract before saving it and refreshes deterministic progress', async () => {
     let saved = false
-    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-      const path = new URL(url).pathname
-      if (path === '/api/catalog') return response(catalog)
-      if (path === '/api/market-status') return response({ provider: 'disabled', enabled: false, cache_ttl_seconds: 0, minimum_request_interval_ms: 0, cached_searches: 0, max_candidates_per_skin: 200 })
-      if (path === '/api/sync-status') return response({ running: false, last_success_at: null, last_error: null, imported_skins: 0, imported_collections: 0, caps_verification: null })
-      if (path === '/api/regressions/status') return response({ count: saved ? 1 : 0, evidence_backed_records: saved ? 1 : 0, evidence_backed_exact_matches: saved ? 1 : 0, records_missing_evidence: 0, exact_matches: saved ? 1 : 0, mismatches: 0, ready_for_target: false, target_count: 20 })
-      if (path === '/api/analyze') return response(analysis)
-      if (path === '/api/regressions/contracts') {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_catalog') return Promise.resolve(catalog)
+      if (command === 'get_market_status') return Promise.resolve({ provider: 'disabled', enabled: false, cache_ttl_seconds: 0, minimum_request_interval_ms: 0, cached_searches: 0, max_candidates_per_skin: 200 })
+      if (command === 'get_sync_status') return Promise.resolve({ running: false, last_success_at: null, last_error: null, imported_skins: 0, imported_collections: 0, caps_verification: null })
+      if (command === 'get_regression_status') return Promise.resolve({ count: saved ? 1 : 0, evidence_backed_records: saved ? 1 : 0, evidence_backed_exact_matches: saved ? 1 : 0, records_missing_evidence: 0, exact_matches: saved ? 1 : 0, mismatches: 0, ready_for_target: false, target_count: 20 })
+      if (command === 'analyze_contract') return Promise.resolve(analysis)
+      if (command === 'record_contract') {
         saved = true
-        return response({ id: 'contract-fixture', predicted_float: predicted, actual_output_float: predicted, exact_float32_match: true, absolute_difference: float32(0), catalog_schema_version: 'fixture-catalog' })
+        return Promise.resolve({ id: 'contract-fixture', predicted_float: predicted, actual_output_float: predicted, exact_float32_match: true, absolute_difference: float32(0), catalog_schema_version: 'fixture-catalog' })
       }
-      return Promise.reject(new Error(`Unexpected request: ${url} ${init?.method ?? 'GET'}`))
+      return Promise.reject(new Error(`Unexpected command: ${command}`))
     })
-    vi.stubGlobal('fetch', fetchMock)
 
     render(<App />)
 
@@ -105,8 +103,8 @@ describe('regression collector', () => {
     expect(await screen.findByText(/Сохранено: bit-exact совпадение/)).toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('1 / 20')).toBeInTheDocument())
 
-    const previewRequest = fetchMock.mock.calls.find(([url]) => new URL(url).pathname === '/api/analyze')
-    expect(JSON.parse(String(previewRequest?.[1]?.body))).toMatchObject({
+    const previewRequest = invokeMock.mock.calls.find(([command]) => command === 'analyze_contract')
+    expect(previewRequest?.[1]?.request).toMatchObject({
       contract_size: 10,
       stattrak: false,
       inputs: Array.from({ length: 10 }, () => ({ skin_id: inputSkin.id, float_value: 0.1 })),

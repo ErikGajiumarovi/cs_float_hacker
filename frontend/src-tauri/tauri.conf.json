@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Floatcraft",
+  "version": "0.1.0",
+  "identifier": "com.erikgajiumarovi.floatcraft",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "title": "Floatcraft",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 960,
+        "minHeight": 700,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:5173; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5OUVBNkJDNTQzMjdDNzEKUldSeGZESlV2S2FlU1cvTWRSbVNlcXJWdUN5VE9MbEdhNWVXMEhuRDJQTVF4dHdDTlM0U0tmdHcK",
+      "endpoints": [
+        "https://github.com/ErikGajiumarovi/cs_float_hacker/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

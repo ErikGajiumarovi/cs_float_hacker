@@ -172,26 +172,25 @@ outcome pools.
    повторного использования одного listing.
 4. [x] Отдавать 10 purchase/inspect ссылок и пересчитывать корзину при новом
    запросе плана. UI показывает статус provider и свежесть cache.
-5. [~] Normal Steam flow проверен live через Docker. Для StatTrak provider
+5. [~] Normal Steam flow проверен как отдельный live-путь в desktop приложении. Для StatTrak provider
    фильтрует только exact `StatTrak™` market hash и не подмешивает normal-лоты,
    но публичная SSR group-страница пока не даёт подтверждённого отдельного
    StatTrak filter; нужен регулярный live regression smoke-test.
 
 **Результат этапа:** пользователь получает реально покупаемый набор предметов для крафта.
 
-`MARKET_PROVIDER=steam` — default для Docker и standalone запуска; Steam key,
-cookie и CSFloat API не требуются. Для офлайн-математики можно явно задать
-`MARKET_PROVIDER=disabled`. Provider читает текущую публичную SSR-разметку
-Steam Market, поэтому операция зависит от недокументированного формата и
-лимитов Valve.
-`MARKET_CACHE_TTL_SECS` и `STEAM_MARKET_MIN_REQUEST_INTERVAL_MS` обязательны
-для бережного polling. Без provider результат намеренно остаётся `ideal_math`,
-а не искусственной ценовой корзиной.
+Live Market включён в настройках desktop-приложения, но требует одноразового
+подтверждения перед первым запросом. Steam key, cookie и CSFloat API не
+требуются. Режим можно отключить для офлайн-математики. Provider читает текущую
+публичную SSR-разметку Steam Market, поэтому операция зависит от
+недокументированного формата и лимитов Valve. Кэш и rate limit обязательны для
+бережного polling. Без provider результат намеренно остаётся `ideal_math`, а не
+искусственной ценовой корзиной.
 
 Тестовая граница Steam изолирована: production fetcher читает live SSR HTML,
 а обычные Rust-тесты подают в parser/pagination/cache фиксированные HTML
-страницы через in-memory fetcher. Live проверка остаётся
-`./scripts/smoke-steam-market.sh`.
+страницы через in-memory fetcher. Live-проверка выполняется вручную из UI с
+явным включением Market.
 
 ### Этап 4 — ценность и надёжность
 
