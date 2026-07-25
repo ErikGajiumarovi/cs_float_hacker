@@ -6,7 +6,7 @@
 ## Основной импортный источник
 
 - [ByMykel/CSGO-API](https://github.com/ByMykel/CSGO-API), лицензия MIT.
-- Зафиксированный upstream commit:
+- Зафиксированный upstream commit для воспроизводимого локального review:
   `0a2030006075f2e184806bc956223f1e8a42d436`.
 - Входные файлы:
   [`skins.json`](https://raw.githubusercontent.com/ByMykel/CSGO-API/0a2030006075f2e184806bc956223f1e8a42d436/public/api/en/skins.json)
@@ -18,7 +18,12 @@ weapon/paint index и membership в коллекциях. `collections.json` з�
 предметов в коллекции и rarity, поэтому normal trade-up outcome materialize
 как `collection × next_rarity`.
 
-Обновление snapshot:
+Этот SHA используется скриптом локального review. Runtime sync не полагается
+на него как на «текущие данные»: он сначала разрешает актуальные commit SHA
+ByMykel и SteamTracking, сохраняет exact bytes в `runtime/catalog/<commit>/`
+и записывает использованные SHA в `active-catalog.json`/`sync-status.json`.
+
+Обновление review snapshot:
 
 ```bash
 ./scripts/fetch-catalog-snapshots.sh
@@ -67,3 +72,18 @@ asset property `propertyid: 6` в `market_actions`, а цену покупате
 
 Для собственных предметов отдельный inspect-link decoder пока не подключён;
 exact float вводится пользователем и проходит валидацию against caps.
+
+## Детерминированная проверка и evidence
+
+Обычные Rust-тесты не используют эти live URL. Они подают фиксированные bytes
+ByMykel/Valve в materializer каталога и фиксированную Steam SSR HTML-страницу
+в parser, pagination и cache. Поэтому их результат не зависит от сети,
+локального TCP, текущего времени или текущей разметки Market. Отдельный
+`scripts/smoke-steam-market.sh` намеренно остаётся live-проверкой текущей
+разметки Steam.
+
+Публичный inspect link одного item не доказывает историю крафта. Реальная
+regression-запись требует отдельную публичную evidence URL, показывающую 10
+inputs и actual output. В record сохраняются float32 bits и source version
+каталога; повтор той же комбинации input bits/output/evidence URL
+детерминированно отклоняется как duplicate.

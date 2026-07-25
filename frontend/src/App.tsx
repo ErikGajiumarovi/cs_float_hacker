@@ -97,7 +97,35 @@ type Simulation = {
 }
 
 type OwnedInput = { skinId: string; floatValue: string }
+type CollectorInput = { skinId: string; floatValue: string }
 type TargetMode = 'exact' | 'maximum' | 'range'
+
+type RegressionStatus = {
+  count: number
+  evidence_backed_records: number
+  evidence_backed_exact_matches: number
+  records_missing_evidence: number
+  exact_matches: number
+  mismatches: number
+  ready_for_target: boolean
+  target_count: number
+}
+
+type RegressionRecord = {
+  id: string
+  predicted_float: Float32
+  actual_output_float: Float32
+  exact_float32_match: boolean
+  absolute_difference: Float32
+  catalog_schema_version: string
+}
+
+type CollectorPreview = {
+  outcome: Outcome
+  actualFloat: number
+  actualBits: number
+  exactMatch: boolean
+}
 
 const rarityLabel: Record<Rarity, string> = {
   consumer: 'Consumer',
@@ -112,6 +140,17 @@ const rarityLabel: Record<Rarity, string> = {
 function money(cents: number | null) {
   if (cents === null) return '—'
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(cents / 100)
+}
+
+function blankCollectorInputs(): CollectorInput[] {
+  return Array.from({ length: 10 }, () => ({ skinId: '', floatValue: '' }))
+}
+
+function float32Bits(value: number) {
+  const bytes = new ArrayBuffer(4)
+  const view = new DataView(bytes)
+  view.setFloat32(0, value, true)
+  return view.getUint32(0, true)
 }
 
 async function readError(response: Response) {
@@ -154,6 +193,7 @@ export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null)
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
   const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null)
+  const [regressionStatus, setRegressionStatus] = useState<RegressionStatus | null>(null)
   const [targetSkinId, setTargetSkinId] = useState('')
   const [targetMode, setTargetMode] = useState<TargetMode>('exact')
   const [targetValue, setTargetValue] = useState('0.150000')
@@ -170,6 +210,15 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [planning, setPlanning] = useState(false)
   const [simulating, setSimulating] = useState(false)
+  const [collectorInputs, setCollectorInputs] = useState<CollectorInput[]>(blankCollectorInputs)
+  const [actualOutputSkinId, setActualOutputSkinId] = useState('')
+  const [actualOutputFloat, setActualOutputFloat] = useState('')
+  const [evidenceUrl, setEvidenceUrl] = useState('')
+  const [collectorNote, setCollectorNote] = useState('')
+  const [collectorPreview, setCollectorPreview] = useState<CollectorPreview | null>(null)
+  const [collectorRecord, setCollectorRecord] = useState<RegressionRecord | null>(null)
+  const [collectorLoading, setCollectorLoading] = useState(false)
+  const [collectorError, setCollectorError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -185,6 +234,21 @@ export default function App() {
       })
       .catch(problem => setError(`Не удалось загрузить API: ${problem.message}`))
       .finally(() => setLoading(false))
+  }, [])
+
+  async function refreshRegressionStatus() {
+    try {
+      const response = await fetch(`${API_BASE}/api/regressions/status`)
+      if (!response.ok) throw new Error(await readError(response))
+      setRegressionStatus(await response.json() as RegressionStatus)
+    } catch {
+      // The rest of the planner remains useful if the optional collector status
+      // is unavailable during startup or a backend restart.
+    }
+  }
+
+  useEffect(() => {
+    void refreshRegressionStatus()
   }, [])
 
   useEffect(() => {
@@ -207,6 +271,9 @@ export default function App() {
     if (!catalog || !target) return []
     return catalog.skins.filter(skin => skin.collection_id === target.collection_id && skin.rarity === 'classified')
   }, [catalog, target])
+  const collectorSkinChoices = useMemo(() => catalog?.skins
+    .filter(skin => skin.rarity !== 'covert' && skin.rarity !== 'extraordinary')
+    .sort((left, right) => `${left.name} ${left.collection_name}`.localeCompare(`${right.name} ${right.collection_name}`)) ?? [], [catalog])
 
   useEffect(() => {
     if (inputChoices.length > 0) setManualSkinId(inputChoices[0].id)
@@ -223,6 +290,100 @@ export default function App() {
 
   function removeOwned(index: number) {
     setOwnedInputs(current => current.filter((_, position) => position !== index))
+  }
+
+  function updateCollectorInput(index: number, patch: Partial<CollectorInput>) {
+    setCollectorInputs(current => current.map((input, position) => position === index ? { ...input, ...patch } : input))
+    setCollectorPreview(null)
+    setCollectorRecord(null)
+  }
+
+  function resetCollectorPreview() {
+    setCollectorPreview(null)
+    setCollectorRecord(null)
+  }
+
+  function collectorPayload() {
+    return {
+      inputs: collectorInputs.map(input => ({ skin_id: input.skinId, float_value: Number(input.floatValue) })),
+      actual_output_skin_id: actualOutputSkinId,
+      actual_output_float: Number(actualOutputFloat),
+      evidence_url: evidenceUrl.trim(),
+      note: collectorNote.trim() || undefined,
+    }
+  }
+
+  function validateCollector() {
+    const outputFloat = Number(actualOutputFloat)
+    if (collectorInputs.some(input => !input.skinId || !Number.isFinite(Number(input.floatValue)))) {
+      return 'Заполните все 10 входов: skin и конечный float.'
+    }
+    if (!actualOutputSkinId || !Number.isFinite(outputFloat)) {
+      return 'Выберите фактический output и укажите его точный float.'
+    }
+    try {
+      const parsed = new URL(evidenceUrl.trim())
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error()
+    } catch {
+      return 'Evidence URL должна быть абсолютной публичной http(s)-ссылкой.'
+    }
+    return null
+  }
+
+  async function previewCollector() {
+    const validationError = validateCollector()
+    if (validationError) {
+      setCollectorError(validationError)
+      return
+    }
+    setCollectorLoading(true)
+    setCollectorError(null)
+    setCollectorRecord(null)
+    try {
+      const payload = collectorPayload()
+      const response = await fetch(`${API_BASE}/api/analyze`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contract_size: 10, stattrak: false, inputs: payload.inputs }),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      const analysis = await response.json() as Simulation
+      const outcome = analysis.outcomes.find(item => item.skin_id === payload.actual_output_skin_id)
+      if (!outcome) throw new Error('Указанный фактический output невозможен для этих десяти входов.')
+      const actualBits = float32Bits(payload.actual_output_float)
+      setCollectorPreview({
+        outcome,
+        actualFloat: payload.actual_output_float,
+        actualBits,
+        exactMatch: outcome.predicted_float.bits === actualBits,
+      })
+    } catch (problem) {
+      setCollectorPreview(null)
+      setCollectorError(problem instanceof Error ? problem.message : 'Не удалось проверить контракт')
+    } finally {
+      setCollectorLoading(false)
+    }
+  }
+
+  async function submitCollector() {
+    if (!collectorPreview) return
+    setCollectorLoading(true)
+    setCollectorError(null)
+    try {
+      const response = await fetch(`${API_BASE}/api/regressions/contracts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(collectorPayload()),
+      })
+      if (!response.ok) throw new Error(await readError(response))
+      setCollectorRecord(await response.json() as RegressionRecord)
+      setCollectorPreview(null)
+      await refreshRegressionStatus()
+    } catch (problem) {
+      setCollectorError(problem instanceof Error ? problem.message : 'Не удалось сохранить проверку')
+    } finally {
+      setCollectorLoading(false)
+    }
   }
 
   async function requestPlan(event: FormEvent) {
@@ -394,6 +555,59 @@ export default function App() {
       <div className="card result-card"><div className="section-heading"><div><p className="eyebrow">all outcomes</p><h2>Не смешиваем шанс и float</h2></div></div><OutcomeTable outcomes={plan.all_outcomes} /></div>
       <Warnings messages={plan.warnings} />
     </section>}
+
+    <section className="container regression-section">
+      <div className="regression-card card">
+        <div className="section-heading">
+          <div><p className="eyebrow">evidence-backed regressions</p><h2>Набор фактических контрактов</h2><p>В базу попадёт только контракт, который сначала пересчитан локальным float32-ядром и снабжён публичным доказательством.</p></div>
+          <span className={`tag ${regressionStatus?.ready_for_target ? 'tag-ready' : ''}`}>{regressionStatus?.ready_for_target ? 'готово' : 'в сборе'}</span>
+        </div>
+        {regressionStatus ? <div className="progress-grid">
+          <div><span>Подтверждённые exact</span><strong>{regressionStatus.evidence_backed_exact_matches} / {regressionStatus.target_count}</strong><small>и evidence, и совпадение bits</small></div>
+          <div><span>С evidence</span><strong>{regressionStatus.evidence_backed_records}</strong><small>всего записей: {regressionStatus.count}</small></div>
+          <div><span>Расхождения</span><strong>{regressionStatus.mismatches}</strong><small>требуют отдельной проверки</small></div>
+          <div><span>Без evidence</span><strong>{regressionStatus.records_missing_evidence}</strong><small>старые локальные записи</small></div>
+        </div> : <p className="empty">Статус regression-набора временно недоступен.</p>}
+      </div>
+
+      <form className="collector card" onSubmit={event => { event.preventDefault(); void previewCollector() }}>
+        <div className="section-heading"><div><p className="eyebrow">new verified contract</p><h2>Добавить фактический контракт</h2><p>Стандартный normal-контракт: 10 input skins одной rarity без StatTrak. Сначала нажмите «Проверить», затем сохраните только просмотренный результат.</p></div><span className="tag">10 inputs</span></div>
+        <div className="collector-inputs">
+          {collectorInputs.map((input, index) => <div className="collector-row" key={index}>
+            <span className="slot">{index + 1}</span>
+            <select aria-label={`Input skin ${index + 1}`} value={input.skinId} onChange={event => updateCollectorInput(index, { skinId: event.target.value })}>
+              <option value="">Выберите входной skin</option>
+              {collectorSkinChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name} · {skin.collection_name} · {rarityLabel[skin.rarity]}</option>)}
+            </select>
+            <input aria-label={`Input float ${index + 1}`} inputMode="decimal" placeholder="Exact float" value={input.floatValue} onChange={event => updateCollectorInput(index, { floatValue: event.target.value })} />
+          </div>)}
+        </div>
+        <div className="form-grid two collector-output">
+          <label>Фактический output
+            <select value={actualOutputSkinId} onChange={event => { setActualOutputSkinId(event.target.value); resetCollectorPreview() }}>
+              <option value="">Выберите выпавший skin</option>
+              {catalog?.skins.map(skin => <option value={skin.id} key={skin.id}>{skin.name} · {skin.collection_name}</option>)}
+            </select>
+          </label>
+          <label>Exact output float<input inputMode="decimal" placeholder="например, 0.150000006" value={actualOutputFloat} onChange={event => { setActualOutputFloat(event.target.value); resetCollectorPreview() }} /></label>
+        </div>
+        <label className="collector-evidence">Публичная evidence URL<input type="url" placeholder="https://… — capture, video или публичный профиль с составом и output" value={evidenceUrl} onChange={event => { setEvidenceUrl(event.target.value); resetCollectorPreview() }} /></label>
+        <label className="collector-evidence">Комментарий <span className="optional">optional</span><input placeholder="Например: FN/MW boundary; порядок слотов 1→10" value={collectorNote} onChange={event => { setCollectorNote(event.target.value); resetCollectorPreview() }} /></label>
+        {collectorError && <p className="collector-error">{collectorError}</p>}
+        {collectorPreview && <div className={`collector-preview ${collectorPreview.exactMatch ? 'match' : 'mismatch'}`}>
+          <div><span>Прогноз API</span><strong><FloatValue value={collectorPreview.outcome.predicted_float} bits /></strong><small>{collectorPreview.outcome.skin_name} · {collectorPreview.outcome.wear.name}</small></div>
+          <div><span>Фактический float32</span><strong className="mono">{collectorPreview.actualFloat.toFixed(9)} <small>· 0x{collectorPreview.actualBits.toString(16).padStart(8, '0')}</small></strong><small>{collectorPreview.exactMatch ? 'bit-exact совпадение' : 'bits отличаются — запись сохранится как mismatch'}</small></div>
+          <div><span>Шанс output</span><strong>{collectorPreview.outcome.probability_percent}</strong><small>по составу коллекций</small></div>
+        </div>}
+        {collectorRecord && <div className={`collector-saved ${collectorRecord.exact_float32_match ? 'match' : 'mismatch'}`}>
+          Сохранено: {collectorRecord.exact_float32_match ? 'bit-exact совпадение' : 'расхождение зафиксировано'} · Δ <FloatValue value={collectorRecord.absolute_difference} bits /> · каталог {collectorRecord.catalog_schema_version}
+        </div>}
+        <div className="collector-actions">
+          <button className="secondary" disabled={collectorLoading} type="submit">{collectorLoading ? 'Проверяю…' : 'Проверить перед сохранением'}</button>
+          <button className="primary collector-save" disabled={collectorLoading || !collectorPreview} type="button" onClick={() => void submitCollector()}>{collectorLoading ? 'Сохраняю…' : 'Сохранить evidence-backed запись'}</button>
+        </div>
+      </form>
+    </section>
 
     <section className="container simulator card">
       <div className="section-heading"><div><p className="eyebrow">forward validation</p><h2>Проверить ручной контракт</h2><p>Десять одинаковых входов — быстрый способ проверить float32-формулу и wear boundary.</p></div><span className="tag">manual</span></div>

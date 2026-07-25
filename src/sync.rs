@@ -179,16 +179,15 @@ impl SyncService {
             .await?;
         let items_game = self.get_bytes(&format!("https://raw.githubusercontent.com/{STEAMTRACKING_REPO}/{steamtracking_commit}/game/csgo/pak01_dir/scripts/items/items_game.txt")).await?;
 
-        let upstream_skins: Vec<UpstreamSkin> = serde_json::from_slice(&skins)
-            .map_err(|error| format!("cannot parse ByMykel skins.json: {error}"))?;
-        let imported_collections: Vec<serde_json::Value> = serde_json::from_slice(&collections)
-            .map_err(|error| format!("cannot parse ByMykel collections.json: {error}"))?;
-        let valve_caps = parse_valve_paint_caps(
-            std::str::from_utf8(&items_game).map_err(|error| error.to_string())?,
-        );
-        let verification = verify_caps(&upstream_skins, &valve_caps);
-        let catalog =
-            Catalog::from_upstream_snapshot(&skins, &bymykel_commit, now_epoch().to_string())?;
+        let retrieved_at = now_epoch();
+        let result = materialize_sync_result(
+            &bymykel_commit,
+            &steamtracking_commit,
+            &skins,
+            &collections,
+            &items_game,
+            retrieved_at.to_string(),
+        )?;
 
         let snapshot_dir = self.data_dir.join("catalog").join(&bymykel_commit);
         fs::create_dir_all(&snapshot_dir)
@@ -202,7 +201,7 @@ impl SyncService {
             .map_err(|error| error.to_string())?;
         fs::write(
             snapshot_dir.join("verification.json"),
-            serde_json::to_vec_pretty(&verification).map_err(|error| error.to_string())?,
+            serde_json::to_vec_pretty(&result.verification).map_err(|error| error.to_string())?,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -213,22 +212,15 @@ impl SyncService {
                 "steamtracking_commit": steamtracking_commit,
                 "skins_path": snapshot_dir.join("skins.json"),
                 "collections_path": snapshot_dir.join("collections.json"),
-                "verified_at": now_epoch()
+                "verified_at": retrieved_at
             }))
             .map_err(|error| error.to_string())?,
         )
         .await
         .map_err(|error| error.to_string())?;
-        catalog.store_runtime(&self.data_dir)?;
+        result.catalog.store_runtime(&self.data_dir)?;
 
-        Ok(SyncResult {
-            bymykel_commit,
-            steamtracking_commit,
-            imported_skins: upstream_skins.len(),
-            imported_collections: imported_collections.len(),
-            verification,
-            catalog,
-        })
+        Ok(result)
     }
 
     async fn resolve_commit(&self, repository: &str, branch: &str) -> Result<String, String> {
@@ -279,6 +271,35 @@ struct SyncResult {
     imported_collections: usize,
     verification: CapsVerification,
     catalog: Catalog,
+}
+
+/// Converts immutable upstream bytes into the exact catalog artifact used by
+/// the planner.  Network and filesystem work deliberately remain outside this
+/// function, so the importer is reproducible from checked-in fixtures.
+fn materialize_sync_result(
+    bymykel_commit: &str,
+    steamtracking_commit: &str,
+    skins: &[u8],
+    collections: &[u8],
+    items_game: &[u8],
+    retrieved_at: String,
+) -> Result<SyncResult, String> {
+    let upstream_skins: Vec<UpstreamSkin> = serde_json::from_slice(skins)
+        .map_err(|error| format!("cannot parse ByMykel skins.json: {error}"))?;
+    let imported_collections: Vec<serde_json::Value> = serde_json::from_slice(collections)
+        .map_err(|error| format!("cannot parse ByMykel collections.json: {error}"))?;
+    let valve_caps =
+        parse_valve_paint_caps(std::str::from_utf8(items_game).map_err(|error| error.to_string())?);
+    let verification = verify_caps(&upstream_skins, &valve_caps);
+    let catalog = Catalog::from_upstream_snapshot(skins, bymykel_commit, retrieved_at)?;
+    Ok(SyncResult {
+        bymykel_commit: bymykel_commit.to_owned(),
+        steamtracking_commit: steamtracking_commit.to_owned(),
+        imported_skins: upstream_skins.len(),
+        imported_collections: imported_collections.len(),
+        verification,
+        catalog,
+    })
 }
 
 fn now_epoch() -> u64 {
@@ -449,5 +470,37 @@ mod tests {
     fn parses_valve_paint_cap_block() {
         let vdf = r#""paint_kits" { "282" { "wear_remap_min" "0.10" "wear_remap_max" "0.70" } }"#;
         assert_eq!(parse_valve_paint_caps(vdf).get("282"), Some(&(0.1, 0.7)));
+    }
+
+    #[test]
+    fn materializes_a_versioned_catalog_from_fixed_source_bytes() {
+        let skins = br#"[
+          {"id":"input","name":"Input","min_float":0.1,"max_float":0.7,"rarity":{"id":"rarity_legendary_weapon"},"stattrak":true,"paint_index":"282","collections":[{"id":"collection-test","name":"Test"}]},
+          {"id":"output","name":"Output","min_float":0.0,"max_float":1.0,"rarity":{"id":"rarity_ancient_weapon"},"stattrak":true,"paint_index":"283","collections":[{"id":"collection-test","name":"Test"}]}
+        ]"#;
+        let collections = br#"[{"id":"collection-test"}]"#;
+        let items_game = br#""paint_kits" {
+          "282" { "wear_remap_min" "0.10" "wear_remap_max" "0.70" }
+          "283" { "wear_remap_min" "0.00" "wear_remap_max" "1.00" }
+        }"#;
+
+        let result = materialize_sync_result(
+            "bymykel-fixture",
+            "steamtracking-fixture",
+            skins,
+            collections,
+            items_game,
+            "1700000000".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(result.bymykel_commit, "bymykel-fixture");
+        assert_eq!(result.steamtracking_commit, "steamtracking-fixture");
+        assert_eq!(result.imported_skins, 2);
+        assert_eq!(result.imported_collections, 1);
+        assert_eq!(result.verification.matching, 2);
+        assert_eq!(result.catalog.schema_version, "bymykel-bymykel-fixture");
+        assert_eq!(result.catalog.source.retrieved_at, "1700000000");
+        assert!(result.catalog.skin("collection-test/output").is_some());
     }
 }

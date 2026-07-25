@@ -47,8 +47,11 @@ docker compose up --build
   подбор одного ближайшего лота на каждый слот по отдельности.
 - Реальные caps/collection edges для Knight → Dragon Lore (100%) и Chroma
   (два возможных Covert outcome), плюс React/TypeScript UI.
-- Regression tests, включая результат последовательного `f32`, проверенный
-  вручную по FloatJitsu.
+- Evidence-backed collector в UI: 10 входов → preview фактического output на
+  уровне `float32` bits → явное сохранение записи и progress к 20 регрессиям.
+- Детерминированный offline test suite для `f32`-математики, importer, Steam
+  SSR parser/pagination/cache, regression storage и collector UI. Live Steam
+  оставлен отдельным smoke-test, а не частью обычного тестового запуска.
 - Постоянный background sync: при старте и затем раз в 24 часа backend берёт
   актуальные pinned commits ByMykel + SteamTracking, хранит полный snapshot в
   Docker volume `./runtime/`, materialize-ит `planner-catalog.json` и
@@ -114,7 +117,10 @@ Steam не документирует SSR-разметку как стабиль
 Игра и публичные inspect APIs не публикуют историю самого контракта — они
 раскрывают данные **одного** предмета, но не связывают 10 входов с реально
 полученным output. Поэтому приложение не заполняет regression suite
-придуманными записями. Вместо этого есть persistent collector:
+придуманными записями. В UI есть форма «Добавить фактический контракт»: она
+сначала вызывает `POST /api/analyze`, показывает predicted и actual `float32`
+bits и только затем разрешает сохранить результат. API остаётся доступен для
+автоматизированного сбора:
 
 ```bash
 curl -X POST http://localhost:8080/api/regressions/contracts \
@@ -125,19 +131,47 @@ curl http://localhost:8080/api/regressions/status | jq
 ```
 
 `actual-contract.json` содержит 10 `{ "skin_id", "float_value" }`,
-`actual_output_skin_id`, `actual_output_float` и, желательно, `evidence_url`
-с inspect link/публичным доказательством. Запись сохраняется в
-`runtime/actual-contracts.json` вместе с predicted и actual float32 bits.
-После 20 фактических записей endpoint отметит suite как готовый. Collector
-валидирует paths активного versioned runtime-каталога и не создаёт мнимые
-«фактические» крафты сам.
+`actual_output_skin_id`, `actual_output_float` и обязательный `evidence_url`:
+публичную ссылку на capture/video/профиль или другой сохранённый материал,
+который показывает состав контракта и его результат. Inspect link одного
+предмета полезен как дополнение, но сам по себе не доказывает все десять
+входов. Запись сохраняется в `runtime/actual-contracts.json` вместе с
+predicted и actual float32 bits, а также версией и URL каталога, по которым
+сделан расчёт. ID записи детерминированно строится из всех input float bits,
+output и evidence URL, поэтому повторная отправка того же доказательства
+отклоняется, а не создаёт дубликат. Suite готов только после 20
+evidence-backed записей с точным float32 совпадением. Статус отдельно отдаёт
+`evidence_backed_records`, `evidence_backed_exact_matches`, `mismatches` и
+`records_missing_evidence`. Collector валидирует paths активного versioned
+runtime-каталога и не создаёт мнимые «фактические» крафты сам.
+
+Smoke-test live Steam provider после запуска API:
+
+```bash
+./scripts/smoke-steam-market.sh
+```
+
+Скрипт выбирает поддерживаемую Covert-цель из активного каталога, запрашивает
+план и завершается с ошибкой, если Steam не вернул десять конкретных лотов с
+ценой, Market URL и inspect link. Это проверка интеграции с текущей SSR-разметкой,
+а не доказательство результата совершённого контракта.
 
 Проверки:
 
 ```bash
 cargo test
-cd frontend && npm run build
+cd frontend && npm test && npm run build
 ```
+
+Rust-suite использует фиксированные catalog/Valve/Steam SSR fixtures и не
+открывает локальный TCP-порт. UI-suite подменяет API детерминированными
+ответами и проверяет путь collector: 10 inputs → float32 preview → сохранение
+→ обновлённый progress. Live Steam smoke-test остаётся отдельной внешней
+проверкой, потому что SSR-разметка Valve не является стабильным API.
+
+На текущем состоянии `cargo test` содержит 18 offline Rust-тестов, а
+`npm test` — UI workflow-тест collector. Количество тестов может расти, но
+обычный test path не должен обращаться к Steam, GitHub или реальному TCP.
 
 ## Пример API
 

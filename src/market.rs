@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -103,12 +105,56 @@ struct CachedSearch {
     listings: Vec<FixtureListing>,
 }
 
+type PageFetchFuture = Pin<Box<dyn Future<Output = Result<SteamMarketPage, PlannerError>> + Send>>;
+
+/// The only live-network boundary of the Market provider.  Keeping it behind
+/// this small interface lets parser, pagination, cache and optimizer tests use
+/// fixed HTML fixtures without opening a TCP port or relying on Steam.
+trait MarketPageFetcher: Send + Sync {
+    fn fetch_page(&self, url: Url) -> PageFetchFuture;
+}
+
+struct HttpMarketPageFetcher {
+    client: Client,
+}
+
+impl MarketPageFetcher for HttpMarketPageFetcher {
+    fn fetch_page(&self, url: Url) -> PageFetchFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let response = client
+                .get(url)
+                .header("accept", "text/html,application/xhtml+xml")
+                .header("user-agent", "Floatcraft/0.1 Steam Community Market reader")
+                .send()
+                .await
+                .map_err(|error| {
+                    PlannerError::Catalog(format!("Steam Market listing request failed: {error}"))
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(PlannerError::Catalog(format!(
+                    "Steam Market listing request returned HTTP {status}"
+                )));
+            }
+            let html = response.text().await.map_err(|error| {
+                PlannerError::Catalog(format!(
+                    "Steam Market listing response could not be read: {error}"
+                ))
+            })?;
+            parse_steam_market_page(&html).map_err(|error| {
+                PlannerError::Catalog(format!("Steam Market listing HTML is invalid: {error}"))
+            })
+        })
+    }
+}
+
 /// Reads the public server-rendered Steam Community Market page.  The modern
 /// Market page embeds the current listings in `window.SSR.renderContext`; it
 /// includes the asset's raw float and the property used by its inspect link.
 /// No Steam account, session cookie or third-party marketplace is used.
 pub struct SteamCommunityMarketProvider {
-    client: Client,
+    page_fetcher: Arc<dyn MarketPageFetcher>,
     market_listing_base: Url,
     cache_ttl: Duration,
     minimum_request_interval: Duration,
@@ -142,7 +188,7 @@ impl SteamCommunityMarketProvider {
             .build()
             .map_err(|error| format!("cannot create Steam Market client: {error}"))?;
         Ok(Self {
-            client,
+            page_fetcher: Arc::new(HttpMarketPageFetcher { client }),
             market_listing_base,
             cache_ttl,
             minimum_request_interval,
@@ -152,9 +198,9 @@ impl SteamCommunityMarketProvider {
     }
 
     #[cfg(test)]
-    fn for_test(market_listing_base: Url) -> Self {
+    fn for_test(market_listing_base: Url, page_fetcher: Arc<dyn MarketPageFetcher>) -> Self {
         Self {
-            client: Client::builder().build().unwrap(),
+            page_fetcher,
             market_listing_base,
             cache_ttl: Duration::from_secs(60),
             minimum_request_interval: Duration::ZERO,
@@ -318,30 +364,7 @@ impl SteamCommunityMarketProvider {
             .append_pair("start", &start.to_string())
             .append_pair("currency", &STEAM_USD_CURRENCY.to_string())
             .append_pair("language", "english");
-        let response = self
-            .client
-            .get(url)
-            .header("accept", "text/html,application/xhtml+xml")
-            .header("user-agent", "Floatcraft/0.1 Steam Community Market reader")
-            .send()
-            .await
-            .map_err(|error| {
-                PlannerError::Catalog(format!("Steam Market listing request failed: {error}"))
-            })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(PlannerError::Catalog(format!(
-                "Steam Market listing request returned HTTP {status}"
-            )));
-        }
-        let html = response.text().await.map_err(|error| {
-            PlannerError::Catalog(format!(
-                "Steam Market listing response could not be read: {error}"
-            ))
-        })?;
-        parse_steam_market_page(&html).map_err(|error| {
-            PlannerError::Catalog(format!("Steam Market listing HTML is invalid: {error}"))
-        })
+        self.page_fetcher.fetch_page(url).await
     }
 
     async fn wait_for_rate_limit(&self) {
@@ -515,38 +538,73 @@ fn extract_json_string_literal(input: &str) -> Result<&str, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use axum::{
-        Router,
-        extract::{Path, Query, State},
-        response::IntoResponse,
-        routing::get,
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
     use crate::domain::{PlanningPriority, TargetConstraint};
 
+    struct FixturePageFetcher {
+        pages: Arc<HashMap<usize, String>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FixturePageFetcher {
+        fn new(pages: HashMap<usize, String>) -> Arc<Self> {
+            Arc::new(Self {
+                pages: Arc::new(pages),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+    }
+
+    impl MarketPageFetcher for FixturePageFetcher {
+        fn fetch_page(&self, url: Url) -> PageFetchFuture {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let start = url
+                .query_pairs()
+                .find_map(|(key, value)| (key == "start").then(|| value.parse::<usize>().ok()))
+                .flatten()
+                .unwrap_or(0);
+            let html = self.pages.get(&start).cloned();
+            Box::pin(async move {
+                let html = html.ok_or_else(|| {
+                    PlannerError::Catalog(format!("fixture has no Market page at start={start}"))
+                })?;
+                parse_steam_market_page(&html).map_err(PlannerError::Catalog)
+            })
+        }
+    }
+
     #[tokio::test]
     async fn steam_provider_parses_html_price_float_and_inspect_link_and_uses_cache() {
-        let requests = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route("/market/listings/730/{item}", get(mock_market_page))
-            .with_state(requests.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider = SteamCommunityMarketProvider::for_test(
-            format!("http://{address}/market/listings/730/")
-                .parse()
-                .unwrap(),
-        );
         let skin = test_skin(0.45, 1.0);
+        let item = market_hash_name(&skin, "Battle-Scarred", false);
+        let fetcher = FixturePageFetcher::new(HashMap::from([(
+            0,
+            steam_html(serde_json::json!({
+              "more": false,
+              "listings": [
+                listing("good", &item, 0.55, 100, 15, "ABCDEF"),
+                listing("wrong-float", &item, 0.1, 1, 0, "NOPE"),
+                listing("wrong-name", "Other (Battle-Scarred)", 0.55, 1, 0, "OTHER")
+              ]
+            })),
+        )]));
+        let provider = SteamCommunityMarketProvider::for_test(
+            "https://fixture.test/market/listings/730/".parse().unwrap(),
+            fetcher.clone(),
+        );
 
         let first = provider.fetch_for_skin(&skin, false).await.unwrap();
         let second = provider.fetch_for_skin(&skin, false).await.unwrap();
 
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id, "good");
         assert_eq!(first[0].float_value.to_bits(), 0.55_f32.to_bits());
@@ -559,22 +617,43 @@ mod tests {
         assert_eq!(second[0].id, "good");
     }
 
+    #[test]
+    fn parser_rejects_an_ssr_page_without_listing_context() {
+        let error = parse_steam_market_page("<html><body>no SSR data</body></html>").unwrap_err();
+        assert_eq!(error, "SSR render context is absent");
+    }
+
     #[tokio::test]
     async fn steam_provider_collects_up_to_two_hundred_exact_candidates() {
-        let requests = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route(
-                "/market/listings/730/{item}",
-                get(mock_paginated_market_page),
-            )
-            .with_state(requests.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let item = market_hash_name(&test_skin(0.45, 1.0), "Battle-Scarred", false);
+        let pages = (0..MAX_CANDIDATES_PER_SKIN)
+            .step_by(PAGE_SIZE)
+            .map(|start| {
+                let entries = (start..start + PAGE_SIZE)
+                    .map(|index| {
+                        listing(
+                            &format!("listing-{index}"),
+                            &item,
+                            0.5 + (index as f64 / 10_000.0),
+                            index as u64,
+                            0,
+                            "PAYLOAD",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    start,
+                    steam_html(serde_json::json!({
+                      "more": start + PAGE_SIZE < MAX_CANDIDATES_PER_SKIN,
+                      "listings": entries,
+                    })),
+                )
+            })
+            .collect();
+        let fetcher = FixturePageFetcher::new(pages);
         let provider = SteamCommunityMarketProvider::for_test(
-            format!("http://{address}/market/listings/730/")
-                .parse()
-                .unwrap(),
+            "https://fixture.test/market/listings/730/".parse().unwrap(),
+            fetcher.clone(),
         );
 
         let listings = provider
@@ -582,7 +661,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(requests.load(Ordering::Relaxed), MAX_PAGES_PER_SKIN);
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), MAX_PAGES_PER_SKIN);
         assert_eq!(listings.len(), MAX_CANDIDATES_PER_SKIN);
         assert_eq!(listings.first().unwrap().id, "listing-0");
         assert_eq!(listings.last().unwrap().id, "listing-199");
@@ -590,13 +669,6 @@ mod tests {
 
     #[tokio::test]
     async fn plan_fetches_only_eligible_input_skins_from_steam() {
-        let requests = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route("/market/listings/730/{item}", get(mock_market_page))
-            .with_state(requests);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let catalog = Catalog::from_upstream_snapshot(
             br#"[
               {"id":"input","name":"Input","min_float":0.45,"max_float":1.0,"rarity":{"id":"rarity_legendary_weapon"},"stattrak":true,"collections":[{"id":"collection-test","name":"Test"}]},
@@ -606,10 +678,18 @@ mod tests {
             "now".to_owned(),
         )
         .unwrap();
+        let input = catalog.skin("collection-test/input").unwrap();
+        let item = market_hash_name(input, "Battle-Scarred", false);
+        let fetcher = FixturePageFetcher::new(HashMap::from([(
+            0,
+            steam_html(serde_json::json!({
+              "more": false,
+              "listings": [listing("good", &item, 0.55, 100, 15, "ABCDEF")]
+            })),
+        )]));
         let provider = SteamCommunityMarketProvider::for_test(
-            format!("http://{address}/market/listings/730/")
-                .parse()
-                .unwrap(),
+            "https://fixture.test/market/listings/730/".parse().unwrap(),
+            fetcher,
         );
         let request = PlanRequest {
             target_skin_id: "collection-test/target".to_owned(),
@@ -640,49 +720,6 @@ mod tests {
             def_index: None,
             paint_index: None,
         }
-    }
-
-    async fn mock_market_page(
-        State(requests): State<Arc<AtomicUsize>>,
-        Path(item): Path<String>,
-    ) -> impl IntoResponse {
-        requests.fetch_add(1, Ordering::Relaxed);
-        steam_html(serde_json::json!({
-          "more": false,
-          "listings": [
-            listing("good", &item, 0.55, 100, 15, "ABCDEF"),
-            listing("wrong-float", &item, 0.1, 1, 0, "NOPE"),
-            listing("wrong-name", "Other (Battle-Scarred)", 0.55, 1, 0, "OTHER")
-          ]
-        }))
-    }
-
-    async fn mock_paginated_market_page(
-        State(requests): State<Arc<AtomicUsize>>,
-        Path(item): Path<String>,
-        Query(query): Query<HashMap<String, String>>,
-    ) -> impl IntoResponse {
-        requests.fetch_add(1, Ordering::Relaxed);
-        let start = query
-            .get("start")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let entries = (start..start + PAGE_SIZE)
-            .map(|index| {
-                listing(
-                    &format!("listing-{index}"),
-                    &item,
-                    0.5 + (index as f64 / 10_000.0),
-                    index as u64,
-                    0,
-                    "PAYLOAD",
-                )
-            })
-            .collect::<Vec<_>>();
-        steam_html(serde_json::json!({
-          "more": start + PAGE_SIZE < MAX_CANDIDATES_PER_SKIN,
-          "listings": entries,
-        }))
     }
 
     fn listing(
