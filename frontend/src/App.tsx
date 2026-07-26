@@ -232,6 +232,7 @@ export default function App() {
   const [settings, setSettings] = useState<DesktopSettings | null>(null)
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdate | null>(null)
   const [installingUpdate, setInstallingUpdate] = useState(false)
+  const [syncingCatalog, setSyncingCatalog] = useState(false)
 
   useEffect(() => {
     backend.catalog<Catalog>()
@@ -240,7 +241,7 @@ export default function App() {
         const firstTarget = data.skins.find(skin => skin.id === 'awp-dragon-lore') ?? data.skins.find(skin => skin.rarity === 'covert')
         if (firstTarget) setTargetSkinId(firstTarget.id)
       })
-      .catch(problem => setError(`Не удалось загрузить API: ${problem.message}`))
+      .catch(problem => setError(`Не удалось загрузить локальное ядро: ${problem.message}`))
       .finally(() => setLoading(false))
   }, [])
 
@@ -457,6 +458,18 @@ export default function App() {
     }
   }
 
+  async function syncCatalogNow() {
+    setSyncingCatalog(true)
+    try {
+      setSyncStatus(await backend.syncNow<SyncStatus>())
+      setCatalog(await backend.catalog<Catalog>())
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Не удалось обновить каталог')
+    } finally {
+      setSyncingCatalog(false)
+    }
+  }
+
   if (loading) return <main className="loading"><div className="orbit" />Загрузка каталога и float32-ядра…</main>
 
   return <main>
@@ -473,8 +486,9 @@ export default function App() {
 
     <section className="container notice">
       <strong>Каталог и математика:</strong> после успешной синхронизации планировщик переключается на полный versioned snapshot ByMykel. Лоты появляются только через provider с подтверждённым exact float; встроенный MVP-пул остаётся тестовым fallback.
-      {syncStatus && <span className="sync-line">Catalog sync: {syncStatus.running ? 'обновление…' : syncStatus.last_error ? `ошибка — ${syncStatus.last_error}` : syncStatus.last_success_at ? `${syncStatus.imported_skins} skins / ${syncStatus.imported_collections} collections; direct caps: ${syncStatus.caps_verification?.matching ?? 0} match, ${syncStatus.caps_verification?.mismatching ?? 0} mismatch, ${syncStatus.caps_verification?.not_directly_verifiable ?? 0} review` : 'ожидание первого обновления'}</span>}
-      {marketStatus && <span className="sync-line">Market: {marketStatus.enabled ? `${marketStatus.provider}, cache ${marketStatus.cache_ttl_seconds}s, ≤${marketStatus.max_candidates_per_skin} candidates/skin` : 'provider не настроен — будет показан ideal_math'}</span>}
+      {syncStatus && <span className="sync-line">Catalog sync: {syncStatus.running ? 'обновление…' : syncStatus.last_error ? `offline / ошибка — используется последний валидный каталог: ${syncStatus.last_error}` : syncStatus.last_success_at ? `${syncStatus.imported_skins} skins / ${syncStatus.imported_collections} collections; direct caps: ${syncStatus.caps_verification?.matching ?? 0} match, ${syncStatus.caps_verification?.mismatching ?? 0} mismatch, ${syncStatus.caps_verification?.not_directly_verifiable ?? 0} review` : 'ожидание первого обновления'}</span>}
+      {isTauri && <button className="text-button" type="button" disabled={syncingCatalog || syncStatus?.running} onClick={() => void syncCatalogNow()}>{syncingCatalog || syncStatus?.running ? 'Обновляю каталог…' : 'Обновить каталог'}</button>}
+      {marketStatus && <span className="sync-line">Market: {marketStatus.enabled ? `${marketStatus.provider}, cache ${marketStatus.cache_ttl_seconds}s, ≤20 requests/plan` : 'выключен — будет показан ideal_math'}</span>}
     </section>
 
     {isTauri && settings && <section className="container desktop-banner">

@@ -5,9 +5,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::{Client, header::USER_AGENT};
+use reqwest::{
+    Client, StatusCode,
+    header::{ETAG, IF_NONE_MATCH, USER_AGENT},
+};
 use serde::{Deserialize, Serialize};
-use tokio::{fs, sync::RwLock, time::sleep};
+use tokio::{sync::RwLock, time::sleep};
 
 use crate::catalog::Catalog;
 
@@ -34,6 +37,10 @@ pub struct SyncStatus {
     pub last_error: Option<String>,
     pub bymykel_commit: Option<String>,
     pub steamtracking_commit: Option<String>,
+    #[serde(default)]
+    pub bymykel_commit_etag: Option<String>,
+    #[serde(default)]
+    pub steamtracking_commit_etag: Option<String>,
     pub imported_skins: usize,
     pub imported_collections: usize,
     pub caps_verification: Option<CapsVerification>,
@@ -52,6 +59,8 @@ impl SyncStatus {
             last_error: None,
             bymykel_commit: None,
             steamtracking_commit: None,
+            bymykel_commit_etag: None,
+            steamtracking_commit_etag: None,
             imported_skins: 0,
             imported_collections: 0,
             caps_verification: None,
@@ -60,10 +69,32 @@ impl SyncStatus {
     }
 }
 
+/// Persistence boundary for catalog synchronization. The core keeps network
+/// and catalog validation independent from the embedding; Tauri persists its
+/// state transactionally in SQLite while the old standalone core keeps a
+/// minimal JSON-compatible implementation.
+pub trait SyncPersistence: Send + Sync {
+    fn load_catalog(&self) -> Option<Catalog> {
+        None
+    }
+
+    fn load_status(&self) -> Option<SyncStatus> {
+        None
+    }
+
+    fn record_success(&self, catalog: &Catalog, status: &SyncStatus) -> Result<(), String>;
+
+    fn record_status(&self, status: &SyncStatus) -> Result<(), String>;
+
+    fn regression_count(&self) -> usize {
+        0
+    }
+}
+
 #[derive(Clone)]
 pub struct SyncService {
     client: Client,
-    data_dir: PathBuf,
+    persistence: Arc<dyn SyncPersistence>,
     state: Arc<RwLock<SyncStatus>>,
     catalog: Arc<RwLock<Catalog>>,
     interval_seconds: u64,
@@ -72,6 +103,11 @@ pub struct SyncService {
 #[derive(Debug, Deserialize)]
 struct GitHubCommit {
     sha: String,
+}
+
+struct CommitResolution {
+    sha: Option<String>,
+    etag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +128,17 @@ impl SyncService {
     /// Builds the service with an explicit data directory. Desktop callers use
     /// the operating system's app-data directory instead of a relative path.
     pub fn from_data_dir(catalog: Arc<RwLock<Catalog>>, data_dir: PathBuf) -> Result<Self, String> {
+        let persistence = Arc::new(JsonSyncPersistence {
+            data_dir: data_dir.clone(),
+        });
+        Self::from_persistence(catalog, data_dir.display().to_string(), persistence)
+    }
+
+    pub fn from_persistence(
+        catalog: Arc<RwLock<Catalog>>,
+        data_dir_label: String,
+        persistence: Arc<dyn SyncPersistence>,
+    ) -> Result<Self, String> {
         let interval_seconds = std::env::var("CATALOG_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -104,14 +151,16 @@ impl SyncService {
             .timeout(Duration::from_secs(90))
             .build()
             .map_err(|error| format!("cannot create sync HTTP client: {error}"))?;
-        let state = Arc::new(RwLock::new(SyncStatus::initial(
-            enabled,
-            interval_seconds,
-            &data_dir,
-        )));
+        let mut initial = persistence.load_status().unwrap_or_else(|| {
+            SyncStatus::initial(enabled, interval_seconds, Path::new(&data_dir_label))
+        });
+        initial.enabled = enabled;
+        initial.interval_seconds = interval_seconds;
+        initial.data_dir = data_dir_label;
+        let state = Arc::new(RwLock::new(initial));
         Ok(Self {
             client,
-            data_dir,
+            persistence,
             state,
             catalog,
             interval_seconds,
@@ -179,22 +228,74 @@ impl SyncService {
                 state.last_success_at = Some(now_epoch());
                 state.bymykel_commit = Some(result.bymykel_commit);
                 state.steamtracking_commit = Some(result.steamtracking_commit);
+                state.bymykel_commit_etag = result.bymykel_commit_etag;
+                state.steamtracking_commit_etag = result.steamtracking_commit_etag;
                 state.imported_skins = result.imported_skins;
                 state.imported_collections = result.imported_collections;
                 state.caps_verification = Some(result.verification);
-                state.stored_contract_regressions = read_regression_count(&self.data_dir).await;
+                state.stored_contract_regressions = self.persistence.regression_count();
             }
             Err(error) => state.last_error = Some(error),
         }
-        let _ = persist_status(&self.data_dir, &state).await;
+        let persisted_catalog = self.catalog.read().await.clone();
+        let persisted_status = state.clone();
+        drop(state);
+        let result = if persisted_status.last_error.is_some() {
+            self.persistence.record_status(&persisted_status)
+        } else {
+            self.persistence
+                .record_success(&persisted_catalog, &persisted_status)
+        };
+        if let Err(error) = result {
+            let mut state = self.state.write().await;
+            state.last_error = Some(format!("could not persist catalog state: {error}"));
+        }
     }
 
     async fn sync_once(&self) -> Result<SyncResult, String> {
-        fs::create_dir_all(&self.data_dir)
-            .await
-            .map_err(|error| error.to_string())?;
-        let bymykel_commit = self.resolve_commit(BYMYKEL_REPO, "main").await?;
-        let steamtracking_commit = self.resolve_commit(STEAMTRACKING_REPO, "master").await?;
+        let prior = self.state.read().await.clone();
+        let bymykel_resolution = self
+            .resolve_commit(BYMYKEL_REPO, "main", prior.bymykel_commit_etag.as_deref())
+            .await?;
+        let steamtracking_resolution = self
+            .resolve_commit(
+                STEAMTRACKING_REPO,
+                "master",
+                prior.steamtracking_commit_etag.as_deref(),
+            )
+            .await?;
+        let bymykel_commit = bymykel_resolution
+            .sha
+            .or(prior.bymykel_commit.clone())
+            .ok_or_else(|| "GitHub returned 304 without a persisted ByMykel commit".to_owned())?;
+        let steamtracking_commit = steamtracking_resolution
+            .sha
+            .or(prior.steamtracking_commit.clone())
+            .ok_or_else(|| {
+                "GitHub returned 304 without a persisted SteamTracking commit".to_owned()
+            })?;
+        if prior.bymykel_commit.as_deref() == Some(&bymykel_commit)
+            && prior.steamtracking_commit.as_deref() == Some(&steamtracking_commit)
+        {
+            return Ok(SyncResult {
+                bymykel_commit,
+                steamtracking_commit,
+                bymykel_commit_etag: bymykel_resolution.etag.or(prior.bymykel_commit_etag),
+                steamtracking_commit_etag: steamtracking_resolution
+                    .etag
+                    .or(prior.steamtracking_commit_etag),
+                imported_skins: prior.imported_skins,
+                imported_collections: prior.imported_collections,
+                verification: prior.caps_verification.unwrap_or(CapsVerification {
+                    compared: 0,
+                    matching: 0,
+                    mismatching: 0,
+                    not_directly_verifiable: 0,
+                    examples: Vec::new(),
+                }),
+                catalog: self.catalog.read().await.clone(),
+            });
+        }
         let bymykel_base = format!(
             "https://raw.githubusercontent.com/{BYMYKEL_REPO}/{bymykel_commit}/public/api/en"
         );
@@ -207,7 +308,7 @@ impl SyncService {
         let items_game = self.get_bytes(&format!("https://raw.githubusercontent.com/{STEAMTRACKING_REPO}/{steamtracking_commit}/game/csgo/pak01_dir/scripts/items/items_game.txt")).await?;
 
         let retrieved_at = now_epoch();
-        let result = materialize_sync_result(
+        let mut result = materialize_sync_result(
             &bymykel_commit,
             &steamtracking_commit,
             &skins,
@@ -215,60 +316,51 @@ impl SyncService {
             &items_game,
             retrieved_at.to_string(),
         )?;
-
-        let snapshot_dir = self.data_dir.join("catalog").join(&bymykel_commit);
-        fs::create_dir_all(&snapshot_dir)
-            .await
-            .map_err(|error| error.to_string())?;
-        fs::write(snapshot_dir.join("skins.json"), &skins)
-            .await
-            .map_err(|error| error.to_string())?;
-        fs::write(snapshot_dir.join("collections.json"), &collections)
-            .await
-            .map_err(|error| error.to_string())?;
-        fs::write(
-            snapshot_dir.join("verification.json"),
-            serde_json::to_vec_pretty(&result.verification).map_err(|error| error.to_string())?,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        fs::write(
-            self.data_dir.join("active-catalog.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "bymykel_commit": bymykel_commit,
-                "steamtracking_commit": steamtracking_commit,
-                "skins_path": snapshot_dir.join("skins.json"),
-                "collections_path": snapshot_dir.join("collections.json"),
-                "verified_at": retrieved_at
-            }))
-            .map_err(|error| error.to_string())?,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        result.catalog.store_runtime(&self.data_dir)?;
+        result.bymykel_commit_etag = bymykel_resolution.etag;
+        result.steamtracking_commit_etag = steamtracking_resolution.etag;
 
         Ok(result)
     }
 
-    async fn resolve_commit(&self, repository: &str, branch: &str) -> Result<String, String> {
+    async fn resolve_commit(
+        &self,
+        repository: &str,
+        branch: &str,
+        etag: Option<&str>,
+    ) -> Result<CommitResolution, String> {
         let url = format!("https://api.github.com/repos/{repository}/commits/{branch}");
-        let response = self
+        let mut request = self
             .client
             .get(url)
-            .header(USER_AGENT, "cs-float-planner/0.1")
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+            .header(USER_AGENT, "cs-float-planner/0.1");
+        if let Some(etag) = etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(CommitResolution {
+                sha: None,
+                etag: etag.map(str::to_owned),
+            });
+        }
         if !response.status().is_success() {
             return Err(format!(
                 "GitHub commit lookup failed for {repository}: {}",
                 response.status()
             ));
         }
+        let response_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         response
             .json::<GitHubCommit>()
             .await
-            .map(|commit| commit.sha)
+            .map(|commit| CommitResolution {
+                sha: Some(commit.sha),
+                etag: response_etag,
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -294,6 +386,8 @@ impl SyncService {
 struct SyncResult {
     bymykel_commit: String,
     steamtracking_commit: String,
+    bymykel_commit_etag: Option<String>,
+    steamtracking_commit_etag: Option<String>,
     imported_skins: usize,
     imported_collections: usize,
     verification: CapsVerification,
@@ -322,6 +416,8 @@ fn materialize_sync_result(
     Ok(SyncResult {
         bymykel_commit: bymykel_commit.to_owned(),
         steamtracking_commit: steamtracking_commit.to_owned(),
+        bymykel_commit_etag: None,
+        steamtracking_commit_etag: None,
         imported_skins: upstream_skins.len(),
         imported_collections: imported_collections.len(),
         verification,
@@ -336,25 +432,41 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-async fn persist_status(data_dir: &Path, status: &SyncStatus) -> Result<(), String> {
-    fs::create_dir_all(data_dir)
-        .await
-        .map_err(|error| error.to_string())?;
-    fs::write(
-        data_dir.join("sync-status.json"),
-        serde_json::to_vec_pretty(status).map_err(|error| error.to_string())?,
-    )
-    .await
-    .map_err(|error| error.to_string())
+struct JsonSyncPersistence {
+    data_dir: PathBuf,
 }
 
-async fn read_regression_count(data_dir: &Path) -> usize {
-    let path = data_dir.join("actual-contracts.json");
-    fs::read(path)
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
-        .map_or(0, |records| records.len())
+impl SyncPersistence for JsonSyncPersistence {
+    fn load_catalog(&self) -> Option<Catalog> {
+        Some(Catalog::load_runtime_or_embedded(&self.data_dir))
+    }
+
+    fn load_status(&self) -> Option<SyncStatus> {
+        std::fs::read(self.data_dir.join("sync-status.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    }
+
+    fn record_success(&self, catalog: &Catalog, status: &SyncStatus) -> Result<(), String> {
+        catalog.store_runtime(&self.data_dir)?;
+        self.record_status(status)
+    }
+
+    fn record_status(&self, status: &SyncStatus) -> Result<(), String> {
+        std::fs::create_dir_all(&self.data_dir).map_err(|error| error.to_string())?;
+        std::fs::write(
+            self.data_dir.join("sync-status.json"),
+            serde_json::to_vec_pretty(status).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn regression_count(&self) -> usize {
+        std::fs::read(self.data_dir.join("actual-contracts.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).ok())
+            .map_or(0, |records| records.len())
+    }
 }
 
 fn parse_valve_paint_caps(text: &str) -> BTreeMap<String, (f32, f32)> {

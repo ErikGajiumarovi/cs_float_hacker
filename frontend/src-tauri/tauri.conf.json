@@ -36,7 +36,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5OUVBNkJDNTQzMjdDNzEKUldSeGZESlV2S2FlU1cvTWRSbVNlcXJWdUN5VE9MbEdhNWVXMEhuRDJQTVF4dHdDTlM0U0tmdHcK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU2QUU1MDg0NkRENzFBMDkKUldRSkd0ZHRoRkN1NW92TXFjMTdGNkhTRkxPc25xTjdiWEtTcWc5enl5b3pNdW02ZENLb0lTUXAK",
       "endpoints": [
         "https://github.com/ErikGajiumarovi/cs_float_hacker/releases/latest/download/latest.json"
       ]
