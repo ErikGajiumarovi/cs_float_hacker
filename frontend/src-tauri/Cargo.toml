@@ -1,6 +1,6 @@
 [package]
 name = "floatcraft"
-version = "0.1.2"
+version = "0.1.3"
 description = "CS2 float trade-up planner"
 authors = ["Erik Gajiumarovi"]
 edition = "2024"

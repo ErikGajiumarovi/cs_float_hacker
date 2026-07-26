@@ -1,30 +1,58 @@
 name: Release desktop application
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing stable tag to build and publish (for example v1.2.3)
-        required: true
-        type: string
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  verify:
-    name: Verify protected stable tag
+  prepare:
+    name: Tag a verified main release
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ inputs.tag }}
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      should_release: ${{ steps.release.outputs.should_release }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - id: release
+        name: Create a tag only for a new version
+        run: |
+          version="$(node -p "require('./frontend/src-tauri/tauri.conf.json').version")"
+          test "$version" = "$(node -p "require('./frontend/package.json').version")"
+          release_tag="v$version"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$release_tag" >/dev/null; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git tag -a "$release_tag" "$GITHUB_SHA" -m "Floatcraft $release_tag"
+          git push origin "$release_tag"
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify protected stable tag
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.release_tag }}
           fetch-depth: 0
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -62,11 +90,12 @@ jobs:
 
   upload:
     name: Build and sign (${{ matrix.name }})
-    needs: verify
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ${{ matrix.runner }}
     environment: release
     env:
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     permissions:
       contents: write
     strategy:
@@ -84,7 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare.outputs.release_tag }}
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
@@ -110,8 +139,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: frontend
-          tagName: ${{ inputs.tag }}
-          releaseName: Floatcraft ${{ inputs.tag }}
+          tagName: ${{ needs.prepare.outputs.release_tag }}
+          releaseName: Floatcraft ${{ needs.prepare.outputs.release_tag }}
           releaseBody: Signed stable installers for macOS ARM and Windows x64.
           releaseDraft: true
           prerelease: false
@@ -120,11 +149,12 @@ jobs:
 
   publish:
     name: Publish verified stable release
-    needs: upload
+    needs: [prepare, upload]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     environment: release
     env:
-      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
     permissions:
       contents: write
     steps:
