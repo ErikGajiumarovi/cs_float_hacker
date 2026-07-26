@@ -1,12 +1,15 @@
 name: Release desktop application
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable tag to build and publish (for example v1.2.3)
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions:
@@ -16,9 +19,12 @@ jobs:
   verify:
     name: Verify protected stable tag
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -33,13 +39,14 @@ jobs:
 
       - name: Require a tag commit reachable from protected main
         run: |
-          git fetch origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          git fetch origin main --tags
+          tag_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor "$tag_commit" origin/main
 
       - name: Require tag and manifests to describe the same release version
         run: |
           version="$(node -p "require('./frontend/src-tauri/tauri.conf.json').version")"
-          test "$GITHUB_REF_NAME" = "v$version"
+          test "$RELEASE_TAG" = "v$version"
           test "$version" = "$(node -p "require('./frontend/package.json').version")"
 
       - name: Install frontend dependencies
@@ -58,6 +65,8 @@ jobs:
     needs: verify
     runs-on: ${{ matrix.runner }}
     environment: release
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
     permissions:
       contents: write
     strategy:
@@ -74,6 +83,8 @@ jobs:
             bundles: nsis
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
@@ -99,8 +110,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: frontend
-          tagName: ${{ github.ref_name }}
-          releaseName: Floatcraft ${{ github.ref_name }}
+          tagName: ${{ inputs.tag }}
+          releaseName: Floatcraft ${{ inputs.tag }}
           releaseBody: Signed stable installers for macOS ARM and Windows x64.
           releaseDraft: true
           prerelease: false
@@ -112,10 +123,12 @@ jobs:
     needs: upload
     runs-on: ubuntu-latest
     environment: release
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
     permissions:
       contents: write
     steps:
       - name: Publish the complete draft atomically
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
