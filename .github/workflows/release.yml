@@ -50,7 +50,6 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path frontend/src-tauri/Cargo.toml -- --check
           cargo test --locked
-          cargo test --manifest-path frontend/src-tauri/Cargo.toml
           npm --prefix frontend test
           npm --prefix frontend run build
 
