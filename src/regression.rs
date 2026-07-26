@@ -112,50 +112,13 @@ impl RegressionStore {
         submission: ActualContractSubmission,
     ) -> Result<RegressionRecord, PlannerError> {
         let _guard = self.gate.lock().await;
-        let evidence_url = validate_evidence_url(submission.evidence_url.as_deref())?;
-        let analysis = analyze_contract(
-            catalog,
-            AnalyzeRequest {
-                contract_size: 10,
-                stattrak: false,
-                inputs: submission.inputs.clone(),
-            },
-        )?;
-        let outcome = analysis
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.skin_id == submission.actual_output_skin_id)
-            .ok_or_else(|| {
-                PlannerError::Validation(
-                    "actual output is not a possible outcome of the submitted contract".to_owned(),
-                )
-            })?;
-        let actual = Float32Value::new(submission.actual_output_float);
-        let difference = f32_abs(f32_sub(
-            outcome.predicted_float.value,
-            submission.actual_output_float,
-        ));
-        let id = regression_id(&submission, &evidence_url);
         let mut records = self.read_all().await;
-        if records.iter().any(|record| record.id == id) {
+        let record = prepare_regression_record(catalog, submission, self.clock.now_epoch())?;
+        if records.iter().any(|existing| existing.id == record.id) {
             return Err(PlannerError::Validation(
                 "this exact evidence-backed contract has already been recorded".to_owned(),
             ));
         }
-        let record = RegressionRecord {
-            id,
-            submitted_at: self.clock.now_epoch(),
-            inputs: submission.inputs,
-            actual_output_skin_id: submission.actual_output_skin_id,
-            actual_output_float: actual.clone(),
-            evidence_url: Some(evidence_url),
-            note: submission.note,
-            catalog_schema_version: catalog.schema_version.clone(),
-            catalog_source_url: catalog.source.url.clone(),
-            predicted_float: outcome.predicted_float.clone(),
-            exact_float32_match: outcome.predicted_float.bits == actual.bits,
-            absolute_difference: Float32Value::new(difference),
-        };
         records.push(record.clone());
         let directory = self.path.parent().expect("regression path has a parent");
         fs::create_dir_all(directory)
@@ -180,7 +143,55 @@ impl RegressionStore {
     }
 }
 
-fn regression_status(records: &[RegressionRecord]) -> RegressionStatus {
+/// Validates and calculates a persisted regression record without choosing a
+/// storage backend. The desktop app stores it in SQLite, while the compact
+/// JSON store above remains useful for isolated core tests.
+pub fn prepare_regression_record(
+    catalog: &Catalog,
+    submission: ActualContractSubmission,
+    submitted_at: u64,
+) -> Result<RegressionRecord, PlannerError> {
+    let evidence_url = validate_evidence_url(submission.evidence_url.as_deref())?;
+    let analysis = analyze_contract(
+        catalog,
+        AnalyzeRequest {
+            contract_size: 10,
+            stattrak: false,
+            inputs: submission.inputs.clone(),
+        },
+    )?;
+    let outcome = analysis
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.skin_id == submission.actual_output_skin_id)
+        .ok_or_else(|| {
+            PlannerError::Validation(
+                "actual output is not a possible outcome of the submitted contract".to_owned(),
+            )
+        })?;
+    let actual = Float32Value::new(submission.actual_output_float);
+    let difference = f32_abs(f32_sub(
+        outcome.predicted_float.value,
+        submission.actual_output_float,
+    ));
+    let id = regression_id(&submission, &evidence_url);
+    Ok(RegressionRecord {
+        id,
+        submitted_at,
+        inputs: submission.inputs,
+        actual_output_skin_id: submission.actual_output_skin_id,
+        actual_output_float: actual.clone(),
+        evidence_url: Some(evidence_url),
+        note: submission.note,
+        catalog_schema_version: catalog.schema_version.clone(),
+        catalog_source_url: catalog.source.url.clone(),
+        predicted_float: outcome.predicted_float.clone(),
+        exact_float32_match: outcome.predicted_float.bits == actual.bits,
+        absolute_difference: Float32Value::new(difference),
+    })
+}
+
+pub fn regression_status(records: &[RegressionRecord]) -> RegressionStatus {
     let evidence_backed_records = records
         .iter()
         .filter(|record| record.evidence_url.is_some())
@@ -208,7 +219,7 @@ fn regression_status(records: &[RegressionRecord]) -> RegressionStatus {
     }
 }
 
-fn regression_id(submission: &ActualContractSubmission, evidence_url: &str) -> String {
+pub fn regression_id(submission: &ActualContractSubmission, evidence_url: &str) -> String {
     // FNV-1a is deliberately simple here: it supplies a stable content key,
     // not a cryptographic proof.  The evidence URL and every input bit are
     // included, so retries get the same ID and cannot silently duplicate data.

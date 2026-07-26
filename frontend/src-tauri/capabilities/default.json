@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities required by the main Floatcraft window.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "process:allow-restart",
+    "updater:default"
+  ]
+}

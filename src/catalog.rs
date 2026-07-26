@@ -182,6 +182,27 @@ impl Catalog {
             .map_err(|error| error.to_string())
     }
 
+    /// Serializes the validated planner catalog for an embedding-specific
+    /// store. The desktop application keeps this payload in SQLite rather than
+    /// exposing a filesystem JSON file as its source of truth.
+    pub fn to_persisted_json(&self) -> Result<String, String> {
+        serde_json::to_string(&PersistedCatalog {
+            schema_version: self.schema_version.clone(),
+            source: self.source.clone(),
+            skins: self.skins.clone(),
+            listings: self.listings.clone(),
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Restores and validates a catalog previously produced by
+    /// `to_persisted_json`.
+    pub fn from_persisted_json(json: &str) -> Result<Self, String> {
+        serde_json::from_str::<PersistedCatalog>(json)
+            .map_err(|error| error.to_string())
+            .and_then(Self::from_persisted)
+    }
+
     fn from_persisted(raw: PersistedCatalog) -> Result<Self, String> {
         if raw.skins.is_empty() {
             return Err("catalog has no skins".to_owned());

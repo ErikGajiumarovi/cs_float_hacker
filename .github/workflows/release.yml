@@ -1,0 +1,122 @@
+name: Release desktop application
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify protected stable tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt
+
+      - name: Require a tag commit reachable from protected main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - name: Require tag and manifests to describe the same release version
+        run: |
+          version="$(node -p "require('./frontend/src-tauri/tauri.conf.json').version")"
+          test "$GITHUB_REF_NAME" = "v$version"
+          test "$version" = "$(node -p "require('./frontend/package.json').version")"
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Run release checks
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path frontend/src-tauri/Cargo.toml -- --check
+          cargo test --locked
+          cargo test --manifest-path frontend/src-tauri/Cargo.toml
+          npm --prefix frontend test
+          npm --prefix frontend run build
+
+  upload:
+    name: Build and sign (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    environment: release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+          - name: Windows x64
+            runner: windows-latest
+            target: ''
+            bundles: nsis
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: frontend
+          tagName: ${{ github.ref_name }}
+          releaseName: Floatcraft ${{ github.ref_name }}
+          releaseBody: Signed stable installers for macOS ARM and Windows x64.
+          releaseDraft: true
+          prerelease: false
+          updaterJsonPreferNsis: true
+          args: --config src-tauri/tauri.release.conf.json --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+  publish:
+    name: Publish verified stable release
+    needs: upload
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the complete draft atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

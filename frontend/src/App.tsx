@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react'
-
-const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8080'
+import { openUrl } from '@tauri-apps/plugin-opener'
+import { backend, isTauri } from './backend'
+import { AppUpdate, checkForUpdate } from './updates'
 
 type Rarity = 'consumer' | 'industrial' | 'mil_spec' | 'restricted' | 'classified' | 'covert' | 'extraordinary'
 
@@ -120,6 +121,11 @@ type RegressionRecord = {
   catalog_schema_version: string
 }
 
+type DesktopSettings = {
+  marketEnabled: boolean
+  liveMarketNoticeAcknowledged: boolean
+}
+
 type CollectorPreview = {
   outcome: Outcome
   actualFloat: number
@@ -153,19 +159,22 @@ function float32Bits(value: number) {
   return view.getUint32(0, true)
 }
 
-async function readError(response: Response) {
-  try {
-    const payload = await response.json() as { error?: string }
-    return payload.error ?? `HTTP ${response.status}`
-  } catch {
-    return `HTTP ${response.status}`
-  }
-}
-
 function FloatValue({ value, bits = false }: { value: Float32; bits?: boolean }) {
   return <span className="mono" title={`IEEE-754 float32 bits: 0x${value.bits.toString(16).padStart(8, '0')}`}>
     {value.display}{bits && <small> · 0x{value.bits.toString(16).padStart(8, '0')}</small>}
   </span>
+}
+
+function ExternalLink({ href, children }: { href: string; children: React.ReactNode }) {
+  function openExternally(event: React.MouseEvent<HTMLAnchorElement>) {
+    if (!isTauri) return
+    event.preventDefault()
+    let protocol = ''
+    try { protocol = new URL(href).protocol } catch { return }
+    if (protocol === 'https:' || protocol === 'http:' || protocol === 'steam:') void openUrl(href)
+  }
+
+  return <a href={href} target="_blank" rel="noreferrer" onClick={openExternally}>{children}</a>
 }
 
 function OutcomeTable({ outcomes }: { outcomes: Outcome[] }) {
@@ -220,27 +229,25 @@ export default function App() {
   const [collectorLoading, setCollectorLoading] = useState(false)
   const [collectorError, setCollectorError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [settings, setSettings] = useState<DesktopSettings | null>(null)
+  const [availableUpdate, setAvailableUpdate] = useState<AppUpdate | null>(null)
+  const [installingUpdate, setInstallingUpdate] = useState(false)
+  const [syncingCatalog, setSyncingCatalog] = useState(false)
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/catalog`)
-      .then(async response => {
-        if (!response.ok) throw new Error(await readError(response))
-        return response.json() as Promise<Catalog>
-      })
+    backend.catalog<Catalog>()
       .then(data => {
         setCatalog(data)
         const firstTarget = data.skins.find(skin => skin.id === 'awp-dragon-lore') ?? data.skins.find(skin => skin.rarity === 'covert')
         if (firstTarget) setTargetSkinId(firstTarget.id)
       })
-      .catch(problem => setError(`Не удалось загрузить API: ${problem.message}`))
+      .catch(problem => setError(`Не удалось загрузить локальное ядро: ${problem.message}`))
       .finally(() => setLoading(false))
   }, [])
 
   async function refreshRegressionStatus() {
     try {
-      const response = await fetch(`${API_BASE}/api/regressions/status`)
-      if (!response.ok) throw new Error(await readError(response))
-      setRegressionStatus(await response.json() as RegressionStatus)
+      setRegressionStatus(await backend.regressionStatus<RegressionStatus>())
     } catch {
       // The rest of the planner remains useful if the optional collector status
       // is unavailable during startup or a backend restart.
@@ -252,17 +259,21 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/market-status`)
-      .then(response => response.ok ? response.json() as Promise<MarketStatus> : null)
-      .then(status => { if (status) setMarketStatus(status) })
+    backend.marketStatus<MarketStatus>()
+      .then(status => setMarketStatus(status))
       .catch(() => undefined)
   }, [])
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/sync-status`)
-      .then(response => response.ok ? response.json() as Promise<SyncStatus> : null)
-      .then(status => { if (status) setSyncStatus(status) })
+    backend.syncStatus<SyncStatus>()
+      .then(status => setSyncStatus(status))
       .catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    if (!isTauri) return
+    void backend.settings<DesktopSettings>().then(setSettings).catch(() => undefined)
+    void checkForUpdate().then(setAvailableUpdate).catch(() => undefined)
   }, [])
 
   const target = useMemo(() => catalog?.skins.find(skin => skin.id === targetSkinId) ?? null, [catalog, targetSkinId])
@@ -341,13 +352,7 @@ export default function App() {
     setCollectorRecord(null)
     try {
       const payload = collectorPayload()
-      const response = await fetch(`${API_BASE}/api/analyze`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ contract_size: 10, stattrak: false, inputs: payload.inputs }),
-      })
-      if (!response.ok) throw new Error(await readError(response))
-      const analysis = await response.json() as Simulation
+      const analysis = await backend.analyze<Simulation>({ contract_size: 10, stattrak: false, inputs: payload.inputs })
       const outcome = analysis.outcomes.find(item => item.skin_id === payload.actual_output_skin_id)
       if (!outcome) throw new Error('Указанный фактический output невозможен для этих десяти входов.')
       const actualBits = float32Bits(payload.actual_output_float)
@@ -370,13 +375,7 @@ export default function App() {
     setCollectorLoading(true)
     setCollectorError(null)
     try {
-      const response = await fetch(`${API_BASE}/api/regressions/contracts`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(collectorPayload()),
-      })
-      if (!response.ok) throw new Error(await readError(response))
-      setCollectorRecord(await response.json() as RegressionRecord)
+      setCollectorRecord(await backend.recordContract<RegressionRecord>(collectorPayload()))
       setCollectorPreview(null)
       await refreshRegressionStatus()
     } catch (problem) {
@@ -404,13 +403,7 @@ export default function App() {
       owned_inputs: ownedInputs.map(input => ({ skin_id: input.skinId, float_value: Number(input.floatValue) })),
     }
     try {
-      const response = await fetch(`${API_BASE}/api/plan`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      if (!response.ok) throw new Error(await readError(response))
-      setPlan(await response.json() as Plan)
+      setPlan(await backend.plan<Plan>(payload))
     } catch (problem) {
       setPlan(null)
       setError(problem instanceof Error ? problem.message : 'Не удалось рассчитать план')
@@ -428,17 +421,52 @@ export default function App() {
     setSimulating(true)
     setError(null)
     try {
-      const response = await fetch(`${API_BASE}/api/analyze`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ contract_size: 10, stattrak: false, inputs: actualInputs }),
-      })
-      if (!response.ok) throw new Error(await readError(response))
-      setSimulation(await response.json() as Simulation)
+      setSimulation(await backend.analyze<Simulation>({ contract_size: 10, stattrak: false, inputs: actualInputs }))
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : 'Не удалось проверить контракт')
     } finally {
       setSimulating(false)
+    }
+  }
+
+  async function toggleMarket(enabled: boolean) {
+    try {
+      setSettings(await backend.setMarketEnabled<DesktopSettings>(enabled))
+      setMarketStatus(await backend.marketStatus<MarketStatus>())
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Не удалось изменить настройки Market')
+    }
+  }
+
+  async function acknowledgeMarketNotice() {
+    try {
+      setSettings(await backend.acknowledgeLiveMarketNotice<DesktopSettings>())
+      setMarketStatus(await backend.marketStatus<MarketStatus>())
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Не удалось включить Market')
+    }
+  }
+
+  async function installUpdate() {
+    if (!availableUpdate) return
+    setInstallingUpdate(true)
+    try {
+      await availableUpdate.install()
+    } catch (problem) {
+      setInstallingUpdate(false)
+      setError(problem instanceof Error ? problem.message : 'Не удалось установить обновление')
+    }
+  }
+
+  async function syncCatalogNow() {
+    setSyncingCatalog(true)
+    try {
+      setSyncStatus(await backend.syncNow<SyncStatus>())
+      setCatalog(await backend.catalog<Catalog>())
+    } catch (problem) {
+      setError(problem instanceof Error ? problem.message : 'Не удалось обновить каталог')
+    } finally {
+      setSyncingCatalog(false)
     }
   }
 
@@ -452,15 +480,29 @@ export default function App() {
           <h1>Float<span>craft</span></h1>
           <p className="lede">От желаемого CS2 float — к проверяемому контракту. Вероятность скина, float и стоимость показаны отдельно.</p>
         </div>
-        <div className="engine-card"><span className="pulse" /> Backend computes <strong>IEEE‑754 float32</strong><small>Не JavaScript number</small></div>
+        <div className="engine-card"><span className="pulse" /> Native Rust computes <strong>IEEE‑754 float32</strong><small>Не JavaScript number</small></div>
       </div>
     </header>
 
     <section className="container notice">
       <strong>Каталог и математика:</strong> после успешной синхронизации планировщик переключается на полный versioned snapshot ByMykel. Лоты появляются только через provider с подтверждённым exact float; встроенный MVP-пул остаётся тестовым fallback.
-      {syncStatus && <span className="sync-line">Catalog sync: {syncStatus.running ? 'обновление…' : syncStatus.last_error ? `ошибка — ${syncStatus.last_error}` : syncStatus.last_success_at ? `${syncStatus.imported_skins} skins / ${syncStatus.imported_collections} collections; direct caps: ${syncStatus.caps_verification?.matching ?? 0} match, ${syncStatus.caps_verification?.mismatching ?? 0} mismatch, ${syncStatus.caps_verification?.not_directly_verifiable ?? 0} review` : 'ожидание первого обновления'}</span>}
-      {marketStatus && <span className="sync-line">Market: {marketStatus.enabled ? `${marketStatus.provider}, cache ${marketStatus.cache_ttl_seconds}s, ≤${marketStatus.max_candidates_per_skin} candidates/skin` : 'provider не настроен — будет показан ideal_math'}</span>}
+      {syncStatus && <span className="sync-line">Catalog sync: {syncStatus.running ? 'обновление…' : syncStatus.last_error ? `offline / ошибка — используется последний валидный каталог: ${syncStatus.last_error}` : syncStatus.last_success_at ? `${syncStatus.imported_skins} skins / ${syncStatus.imported_collections} collections; direct caps: ${syncStatus.caps_verification?.matching ?? 0} match, ${syncStatus.caps_verification?.mismatching ?? 0} mismatch, ${syncStatus.caps_verification?.not_directly_verifiable ?? 0} review` : 'ожидание первого обновления'}</span>}
+      {isTauri && <button className="text-button" type="button" disabled={syncingCatalog || syncStatus?.running} onClick={() => void syncCatalogNow()}>{syncingCatalog || syncStatus?.running ? 'Обновляю каталог…' : 'Обновить каталог'}</button>}
+      {marketStatus && <span className="sync-line">Market: {marketStatus.enabled ? `${marketStatus.provider}, cache ${marketStatus.cache_ttl_seconds}s, ≤20 requests/plan` : 'выключен — будет показан ideal_math'}</span>}
     </section>
+
+    {isTauri && settings && <section className="container desktop-banner">
+      <label className="market-toggle"><input type="checkbox" checked={settings.marketEnabled} onChange={event => void toggleMarket(event.target.checked)} /> Получать live-лоты Steam Market</label>
+      {settings.marketEnabled && !settings.liveMarketNoticeAcknowledged && <div className="market-disclosure">
+        <p><strong>Перед первым запросом:</strong> Steam Market provider читает публичную, но недокументированную SSR-разметку. Steam может изменить формат или ограничить запросы; приложение использует кэш и лимит частоты, не передаёт cookie и честно вернётся к ideal_math при ошибке.</p>
+        <button className="secondary" type="button" onClick={() => void acknowledgeMarketNotice()}>Понимаю, включить live Market</button>
+      </div>}
+    </section>}
+
+    {isTauri && availableUpdate && <section className="container desktop-banner update-banner">
+      <div><strong>Доступна Floatcraft {availableUpdate.version}</strong>{availableUpdate.body && <p>{availableUpdate.body}</p>}</div>
+      <button className="primary" type="button" disabled={installingUpdate} onClick={() => void installUpdate()}>{installingUpdate ? 'Устанавливаю…' : 'Скачать и перезапустить'}</button>
+    </section>}
 
     {error && <section className="container error"><strong>Расчёт остановлен:</strong> {error}</section>}
 
@@ -520,7 +562,7 @@ export default function App() {
         <code>adjusted = (raw − min) / (max − min)</code>
         <code>out = out_min + avg(adjusted) × span</code>
         <hr />
-        <p className="subtle">Источник MVP-caps: <a href={catalog?.source.url} target="_blank" rel="noreferrer">{catalog?.source.name}</a> · {catalog?.source.license} · snapshot {catalog?.schema_version}</p>
+        <p className="subtle">Источник MVP-caps: {catalog && <ExternalLink href={catalog.source.url}>{catalog.source.name}</ExternalLink>} · {catalog?.source.license} · snapshot {catalog?.schema_version}</p>
         <p className="subtle">Формула и последовательное float32-округление сверены вручную с FloatJitsu. UI лишь показывает ответ API.</p>
       </aside>
     </section>
@@ -548,7 +590,7 @@ export default function App() {
             <td><FloatValue value={input.float_value} bits /></td>
             <td><FloatValue value={input.adjusted_float} /></td>
             <td>{input.owned ? 'ваш предмет' : money(input.price_cents)}</td>
-            <td>{input.market_url ? <><a href={input.market_url} target="_blank" rel="noreferrer">{input.source} ↗</a>{input.inspect_link && <> · <a href={input.inspect_link}>inspect ↗</a></>}</> : input.source}</td>
+            <td>{input.market_url ? <><ExternalLink href={input.market_url}>{input.source} ↗</ExternalLink>{input.inspect_link && <> · <ExternalLink href={input.inspect_link}>inspect ↗</ExternalLink></>}</> : input.source}</td>
           </tr>)}</tbody>
         </table></div>
       </div>

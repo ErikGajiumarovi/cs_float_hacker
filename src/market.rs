@@ -22,6 +22,8 @@ const DEFAULT_MIN_REQUEST_INTERVAL_MS: u64 = 1_000;
 const MAX_CANDIDATES_PER_SKIN: usize = 200;
 const PAGE_SIZE: usize = 20;
 const MAX_PAGES_PER_SKIN: usize = MAX_CANDIDATES_PER_SKIN / PAGE_SIZE;
+const MAX_SKINS_PER_LIVE_PLAN: usize = 5;
+const MAX_REQUESTS_PER_LIVE_PLAN: usize = 20;
 const STEAM_USD_CURRENCY: u8 = 1;
 
 const WEAR_VARIANTS: [(&str, f32, f32); 5] = [
@@ -232,19 +234,44 @@ impl SteamCommunityMarketProvider {
             ))
         })?;
         let candidate_skins = catalog.input_skins_for_target(target);
+        if candidate_skins.len() > MAX_SKINS_PER_LIVE_PLAN {
+            return Err(PlannerError::Catalog(format!(
+                "Steam Market request budget exceeded: this plan needs {} input-skin searches, while the desktop safety limit is {MAX_SKINS_PER_LIVE_PLAN}. Disable live Market to calculate ideal_math, or narrow the target/owned inputs.",
+                candidate_skins.len()
+            )));
+        }
         let mut listings = Vec::new();
-        for skin in candidate_skins {
-            listings.extend(self.fetch_for_skin(skin, request.stattrak).await?);
+        let mut remaining_pages = MAX_REQUESTS_PER_LIVE_PLAN;
+        let candidate_count = candidate_skins.len();
+        for (index, skin) in candidate_skins.into_iter().enumerate() {
+            let skins_remaining = candidate_count - index;
+            let page_budget = (remaining_pages / skins_remaining).max(1);
+            let fetched = self
+                .fetch_for_skin_with_budget(skin, request.stattrak, page_budget)
+                .await?;
+            remaining_pages = remaining_pages.saturating_sub(page_budget);
+            listings.extend(fetched);
         }
         listings.sort_by_key(|listing| (listing.price_cents, listing.id.clone()));
         listings.dedup_by(|left, right| left.id == right.id);
         Ok(listings)
     }
 
+    #[cfg(test)]
     async fn fetch_for_skin(
         &self,
         skin: &Skin,
         stattrak: bool,
+    ) -> Result<Vec<FixtureListing>, PlannerError> {
+        self.fetch_for_skin_with_budget(skin, stattrak, MAX_PAGES_PER_SKIN)
+            .await
+    }
+
+    async fn fetch_for_skin_with_budget(
+        &self,
+        skin: &Skin,
+        stattrak: bool,
+        page_budget: usize,
     ) -> Result<Vec<FixtureListing>, PlannerError> {
         let key = SearchKey {
             skin_id: skin.id.clone(),
@@ -266,7 +293,7 @@ impl SteamCommunityMarketProvider {
         // Steam returns 20 entries per SSR response.  Split the fixed ten-page
         // budget across the valid exteriors, so wide-cap skins retain coverage
         // instead of collecting all candidates from just one exterior.
-        let pages_per_wear = MAX_PAGES_PER_SKIN.div_ceil(wears.len());
+        let pages_per_wear = page_budget.min(MAX_PAGES_PER_SKIN).div_ceil(wears.len());
         let mut listings = Vec::new();
         let mut seen = HashSet::new();
         for wear in wears {
