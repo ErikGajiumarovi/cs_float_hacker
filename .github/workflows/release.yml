@@ -76,7 +76,7 @@ jobs:
           - name: macOS ARM
             runner: macos-latest
             target: aarch64-apple-darwin
-            bundles: dmg
+            bundles: dmg,updater
           - name: Windows x64
             runner: windows-latest
             target: ''
@@ -128,6 +128,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Require updater artifacts for both supported platforms
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          manifest_dir="$RUNNER_TEMP/floatcraft-release"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir "$manifest_dir"
+          node -e '
+            const manifest = require(process.argv[1]);
+            for (const platform of ["darwin-aarch64", "windows-x86_64-nsis"]) {
+              if (!manifest.platforms?.[platform]?.url || !manifest.platforms?.[platform]?.signature) {
+                throw new Error("Missing signed updater entry for " + platform);
+              }
+            }
+          ' "$manifest_dir/latest.json"
+
       - name: Publish the complete draft atomically
         env:
           GH_TOKEN: ${{ github.token }}
