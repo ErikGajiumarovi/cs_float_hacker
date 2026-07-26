@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "floatcraft"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cs-float-planner",
  "rusqlite",
