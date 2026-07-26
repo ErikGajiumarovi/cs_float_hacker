@@ -555,16 +555,6 @@ export default function App() {
         <button className="primary" disabled={planning || !target}>{planning ? 'Подбираю комбинацию…' : 'Построить проверяемый план →'}</button>
       </form>
 
-      <aside className="math-panel card">
-        <p className="eyebrow">float mapping</p>
-        <h2>«Absolute» float<br />не отдельная БД</h2>
-        <p>Он вычисляется из cap конкретного skin на универсальной шкале 0–1.</p>
-        <code>adjusted = (raw − min) / (max − min)</code>
-        <code>out = out_min + avg(adjusted) × span</code>
-        <hr />
-        <p className="subtle">Источник MVP-caps: {catalog && <ExternalLink href={catalog.source.url}>{catalog.source.name}</ExternalLink>} · {catalog?.source.license} · snapshot {catalog?.schema_version}</p>
-        <p className="subtle">Формула и последовательное float32-округление сверены вручную с FloatJitsu. UI лишь показывает ответ API.</p>
-      </aside>
     </section>
 
     {plan && <section className="container results">
