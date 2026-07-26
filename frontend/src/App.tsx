@@ -36,24 +36,6 @@ type Catalog = {
   limitations: string[]
 }
 
-type SyncStatus = {
-  running: boolean
-  last_success_at: number | null
-  last_error: string | null
-  imported_skins: number
-  imported_collections: number
-  caps_verification: { compared: number; matching: number; mismatching: number; not_directly_verifiable: number } | null
-}
-
-type MarketStatus = {
-  provider: string
-  enabled: boolean
-  cache_ttl_seconds: number
-  minimum_request_interval_ms: number
-  cached_searches: number
-  max_candidates_per_skin: number
-}
-
 type PlannedInput = {
   slot: number
   listing_id: string | null
@@ -98,39 +80,11 @@ type Simulation = {
 }
 
 type OwnedInput = { skinId: string; floatValue: string }
-type CollectorInput = { skinId: string; floatValue: string }
 type TargetMode = 'exact' | 'maximum' | 'range'
-
-type RegressionStatus = {
-  count: number
-  evidence_backed_records: number
-  evidence_backed_exact_matches: number
-  records_missing_evidence: number
-  exact_matches: number
-  mismatches: number
-  ready_for_target: boolean
-  target_count: number
-}
-
-type RegressionRecord = {
-  id: string
-  predicted_float: Float32
-  actual_output_float: Float32
-  exact_float32_match: boolean
-  absolute_difference: Float32
-  catalog_schema_version: string
-}
 
 type DesktopSettings = {
   marketEnabled: boolean
   liveMarketNoticeAcknowledged: boolean
-}
-
-type CollectorPreview = {
-  outcome: Outcome
-  actualFloat: number
-  actualBits: number
-  exactMatch: boolean
 }
 
 const rarityLabel: Record<Rarity, string> = {
@@ -148,21 +102,8 @@ function money(cents: number | null) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(cents / 100)
 }
 
-function blankCollectorInputs(): CollectorInput[] {
-  return Array.from({ length: 10 }, () => ({ skinId: '', floatValue: '' }))
-}
-
-function float32Bits(value: number) {
-  const bytes = new ArrayBuffer(4)
-  const view = new DataView(bytes)
-  view.setFloat32(0, value, true)
-  return view.getUint32(0, true)
-}
-
-function FloatValue({ value, bits = false }: { value: Float32; bits?: boolean }) {
-  return <span className="mono" title={`IEEE-754 float32 bits: 0x${value.bits.toString(16).padStart(8, '0')}`}>
-    {value.display}{bits && <small> · 0x{value.bits.toString(16).padStart(8, '0')}</small>}
-  </span>
+function FloatValue({ value }: { value: Float32 }) {
+  return <span className="mono">{value.display}</span>
 }
 
 function ExternalLink({ href, children }: { href: string; children: React.ReactNode }) {
@@ -181,7 +122,7 @@ function OutcomeTable({ outcomes }: { outcomes: Outcome[] }) {
   return <div className="table-wrap">
     <table>
       <thead>
-        <tr><th>Исход</th><th>Шанс названия</th><th>Прогноз float32</th><th>Wear</th><th>Граница</th></tr>
+        <tr><th>Исход</th><th>Шанс</th><th>Прогноз float</th><th>Состояние</th><th>Ближайшая граница</th></tr>
       </thead>
       <tbody>
         {outcomes.map((outcome) => <tr key={outcome.skin_id}>
@@ -198,11 +139,14 @@ function OutcomeTable({ outcomes }: { outcomes: Outcome[] }) {
   </div>
 }
 
+function planSummary(status: string) {
+  return status === 'closest'
+    ? 'В указанном диапазоне нет подходящего набора; показан ближайший вариант.'
+    : 'Подходящий набор найден.'
+}
+
 export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null)
-  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null)
-  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null)
-  const [regressionStatus, setRegressionStatus] = useState<RegressionStatus | null>(null)
   const [targetSkinId, setTargetSkinId] = useState('')
   const [targetMode, setTargetMode] = useState<TargetMode>('exact')
   const [targetValue, setTargetValue] = useState('0.150000')
@@ -219,20 +163,10 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [planning, setPlanning] = useState(false)
   const [simulating, setSimulating] = useState(false)
-  const [collectorInputs, setCollectorInputs] = useState<CollectorInput[]>(blankCollectorInputs)
-  const [actualOutputSkinId, setActualOutputSkinId] = useState('')
-  const [actualOutputFloat, setActualOutputFloat] = useState('')
-  const [evidenceUrl, setEvidenceUrl] = useState('')
-  const [collectorNote, setCollectorNote] = useState('')
-  const [collectorPreview, setCollectorPreview] = useState<CollectorPreview | null>(null)
-  const [collectorRecord, setCollectorRecord] = useState<RegressionRecord | null>(null)
-  const [collectorLoading, setCollectorLoading] = useState(false)
-  const [collectorError, setCollectorError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [settings, setSettings] = useState<DesktopSettings | null>(null)
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdate | null>(null)
   const [installingUpdate, setInstallingUpdate] = useState(false)
-  const [syncingCatalog, setSyncingCatalog] = useState(false)
 
   useEffect(() => {
     backend.catalog<Catalog>()
@@ -243,31 +177,6 @@ export default function App() {
       })
       .catch(problem => setError(`Не удалось загрузить локальное ядро: ${problem.message}`))
       .finally(() => setLoading(false))
-  }, [])
-
-  async function refreshRegressionStatus() {
-    try {
-      setRegressionStatus(await backend.regressionStatus<RegressionStatus>())
-    } catch {
-      // The rest of the planner remains useful if the optional collector status
-      // is unavailable during startup or a backend restart.
-    }
-  }
-
-  useEffect(() => {
-    void refreshRegressionStatus()
-  }, [])
-
-  useEffect(() => {
-    backend.marketStatus<MarketStatus>()
-      .then(status => setMarketStatus(status))
-      .catch(() => undefined)
-  }, [])
-
-  useEffect(() => {
-    backend.syncStatus<SyncStatus>()
-      .then(status => setSyncStatus(status))
-      .catch(() => undefined)
   }, [])
 
   useEffect(() => {
@@ -301,88 +210,6 @@ export default function App() {
 
   function removeOwned(index: number) {
     setOwnedInputs(current => current.filter((_, position) => position !== index))
-  }
-
-  function updateCollectorInput(index: number, patch: Partial<CollectorInput>) {
-    setCollectorInputs(current => current.map((input, position) => position === index ? { ...input, ...patch } : input))
-    setCollectorPreview(null)
-    setCollectorRecord(null)
-  }
-
-  function resetCollectorPreview() {
-    setCollectorPreview(null)
-    setCollectorRecord(null)
-  }
-
-  function collectorPayload() {
-    return {
-      inputs: collectorInputs.map(input => ({ skin_id: input.skinId, float_value: Number(input.floatValue) })),
-      actual_output_skin_id: actualOutputSkinId,
-      actual_output_float: Number(actualOutputFloat),
-      evidence_url: evidenceUrl.trim(),
-      note: collectorNote.trim() || undefined,
-    }
-  }
-
-  function validateCollector() {
-    const outputFloat = Number(actualOutputFloat)
-    if (collectorInputs.some(input => !input.skinId || !Number.isFinite(Number(input.floatValue)))) {
-      return 'Заполните все 10 входов: skin и конечный float.'
-    }
-    if (!actualOutputSkinId || !Number.isFinite(outputFloat)) {
-      return 'Выберите фактический output и укажите его точный float.'
-    }
-    try {
-      const parsed = new URL(evidenceUrl.trim())
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error()
-    } catch {
-      return 'Evidence URL должна быть абсолютной публичной http(s)-ссылкой.'
-    }
-    return null
-  }
-
-  async function previewCollector() {
-    const validationError = validateCollector()
-    if (validationError) {
-      setCollectorError(validationError)
-      return
-    }
-    setCollectorLoading(true)
-    setCollectorError(null)
-    setCollectorRecord(null)
-    try {
-      const payload = collectorPayload()
-      const analysis = await backend.analyze<Simulation>({ contract_size: 10, stattrak: false, inputs: payload.inputs })
-      const outcome = analysis.outcomes.find(item => item.skin_id === payload.actual_output_skin_id)
-      if (!outcome) throw new Error('Указанный фактический output невозможен для этих десяти входов.')
-      const actualBits = float32Bits(payload.actual_output_float)
-      setCollectorPreview({
-        outcome,
-        actualFloat: payload.actual_output_float,
-        actualBits,
-        exactMatch: outcome.predicted_float.bits === actualBits,
-      })
-    } catch (problem) {
-      setCollectorPreview(null)
-      setCollectorError(problem instanceof Error ? problem.message : 'Не удалось проверить контракт')
-    } finally {
-      setCollectorLoading(false)
-    }
-  }
-
-  async function submitCollector() {
-    if (!collectorPreview) return
-    setCollectorLoading(true)
-    setCollectorError(null)
-    try {
-      setCollectorRecord(await backend.recordContract<RegressionRecord>(collectorPayload()))
-      setCollectorPreview(null)
-      await refreshRegressionStatus()
-    } catch (problem) {
-      setCollectorError(problem instanceof Error ? problem.message : 'Не удалось сохранить проверку')
-    } finally {
-      setCollectorLoading(false)
-    }
   }
 
   async function requestPlan(event: FormEvent) {
@@ -432,7 +259,6 @@ export default function App() {
   async function toggleMarket(enabled: boolean) {
     try {
       setSettings(await backend.setMarketEnabled<DesktopSettings>(enabled))
-      setMarketStatus(await backend.marketStatus<MarketStatus>())
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : 'Не удалось изменить настройки Market')
     }
@@ -441,7 +267,6 @@ export default function App() {
   async function acknowledgeMarketNotice() {
     try {
       setSettings(await backend.acknowledgeLiveMarketNotice<DesktopSettings>())
-      setMarketStatus(await backend.marketStatus<MarketStatus>())
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : 'Не удалось включить Market')
     }
@@ -458,43 +283,21 @@ export default function App() {
     }
   }
 
-  async function syncCatalogNow() {
-    setSyncingCatalog(true)
-    try {
-      setSyncStatus(await backend.syncNow<SyncStatus>())
-      setCatalog(await backend.catalog<Catalog>())
-    } catch (problem) {
-      setError(problem instanceof Error ? problem.message : 'Не удалось обновить каталог')
-    } finally {
-      setSyncingCatalog(false)
-    }
-  }
-
-  if (loading) return <main className="loading"><div className="orbit" />Загрузка каталога и float32-ядра…</main>
+  if (loading) return <main className="loading"><div className="orbit" />Загрузка…</main>
 
   return <main>
     <header className="hero">
       <div className="hero-inner">
         <div>
-          <p className="eyebrow">MVP · reverse trade-up planner</p>
           <h1>Float<span>craft</span></h1>
-          <p className="lede">От желаемого CS2 float — к проверяемому контракту. Вероятность скина, float и стоимость показаны отдельно.</p>
         </div>
-        <div className="engine-card"><span className="pulse" /> Native Rust computes <strong>IEEE‑754 float32</strong><small>Не JavaScript number</small></div>
       </div>
     </header>
-
-    <section className="container notice">
-      <strong>Каталог и математика:</strong> после успешной синхронизации планировщик переключается на полный versioned snapshot ByMykel. Лоты появляются только через provider с подтверждённым exact float; встроенный MVP-пул остаётся тестовым fallback.
-      {syncStatus && <span className="sync-line">Catalog sync: {syncStatus.running ? 'обновление…' : syncStatus.last_error ? `offline / ошибка — используется последний валидный каталог: ${syncStatus.last_error}` : syncStatus.last_success_at ? `${syncStatus.imported_skins} skins / ${syncStatus.imported_collections} collections; direct caps: ${syncStatus.caps_verification?.matching ?? 0} match, ${syncStatus.caps_verification?.mismatching ?? 0} mismatch, ${syncStatus.caps_verification?.not_directly_verifiable ?? 0} review` : 'ожидание первого обновления'}</span>}
-      {isTauri && <button className="text-button" type="button" disabled={syncingCatalog || syncStatus?.running} onClick={() => void syncCatalogNow()}>{syncingCatalog || syncStatus?.running ? 'Обновляю каталог…' : 'Обновить каталог'}</button>}
-      {marketStatus && <span className="sync-line">Market: {marketStatus.enabled ? `${marketStatus.provider}, cache ${marketStatus.cache_ttl_seconds}s, ≤20 requests/plan` : 'выключен — будет показан ideal_math'}</span>}
-    </section>
 
     {isTauri && settings && <section className="container desktop-banner">
       <label className="market-toggle"><input type="checkbox" checked={settings.marketEnabled} onChange={event => void toggleMarket(event.target.checked)} /> Получать live-лоты Steam Market</label>
       {settings.marketEnabled && !settings.liveMarketNoticeAcknowledged && <div className="market-disclosure">
-        <p><strong>Перед первым запросом:</strong> Steam Market provider читает публичную, но недокументированную SSR-разметку. Steam может изменить формат или ограничить запросы; приложение использует кэш и лимит частоты, не передаёт cookie и честно вернётся к ideal_math при ошибке.</p>
+        <p><strong>Перед первым запросом:</strong> приложение использует публичные предложения Steam Market для подбора предметов. Доступность и цены могут меняться.</p>
         <button className="secondary" type="button" onClick={() => void acknowledgeMarketNotice()}>Понимаю, включить live Market</button>
       </div>}
     </section>}
@@ -508,7 +311,7 @@ export default function App() {
 
     <section className="container workspace">
       <form className="planner card" onSubmit={requestPlan}>
-        <div className="section-heading"><div><p className="eyebrow">01 / target</p><h2>Что хотим получить?</h2></div><span className="tag">10 Classified → Covert</span></div>
+        <div className="section-heading"><div><h2>Что хотите получить?</h2></div><span className="tag">Контракт из 10 предметов</span></div>
         <label>Целевой skin
           <select value={targetSkinId} onChange={event => { setTargetSkinId(event.target.value); setPlan(null) }}>
             {targetChoices.map(skin => <option key={skin.id} value={skin.id}>{skin.name} · {skin.collection_name}</option>)}
@@ -531,8 +334,8 @@ export default function App() {
           <label>δ результата<input inputMode="decimal" value={delta} onChange={event => setDelta(event.target.value)} /></label>
         </div>
 
-        <div className="section-heading compact"><div><p className="eyebrow">02 / owned inventory</p><h3>Уже есть {ownedInputs.length} / 10</h3></div><button type="button" className="text-button" onClick={addOwned} disabled={!inputChoices.length || ownedInputs.length >= 10}>+ Добавить предмет</button></div>
-        {ownedInputs.length === 0 ? <p className="empty">Можно оставить пустым или добавить, например, 5 своих M4A1‑S | Knight с exact float.</p> : <div className="owned-list">
+        <div className="section-heading compact"><div><h3>Уже есть {ownedInputs.length} / 10</h3></div><button type="button" className="text-button" onClick={addOwned} disabled={!inputChoices.length || ownedInputs.length >= 10}>+ Добавить предмет</button></div>
+        {ownedInputs.length === 0 ? <p className="empty">Можно оставить пустым или добавить свои предметы.</p> : <div className="owned-list">
           {ownedInputs.map((input, index) => <div className="owned-row" key={index}>
             <span className="slot">{index + 1}</span>
             <select value={input.skinId} onChange={event => updateOwned(index, { skinId: event.target.value })}>
@@ -552,110 +355,49 @@ export default function App() {
           </label>
           <label>Бюджет, USD <span className="optional">optional</span><input inputMode="decimal" placeholder="например, 55000" value={budget} onChange={event => setBudget(event.target.value)} /></label>
         </div>
-        <button className="primary" disabled={planning || !target}>{planning ? 'Подбираю комбинацию…' : 'Построить проверяемый план →'}</button>
+        <button className="primary" disabled={planning || !target}>{planning ? 'Подбираю комбинацию…' : 'Подобрать предметы →'}</button>
       </form>
 
     </section>
 
     {plan && <section className="container results">
       <div className="result-banner">
-        <span className={`status ${plan.status}`}>{plan.status.replace('_', ' ')}</span>
-        <div><strong>{plan.message}</strong><p>{plan.optimizer}</p></div>
+        <span className={`status ${plan.status}`}>{plan.status === 'closest' ? 'ближайший вариант' : 'подходит'}</span>
+        <div><strong>{planSummary(plan.status)}</strong></div>
         <button className="secondary" onClick={() => simulate(plan.selected_inputs.map(item => ({ skin_id: item.skin_id, float_value: item.float_value.value })))} disabled={simulating}>{simulating ? 'Проверяю…' : 'Проверить набор'}</button>
       </div>
       <div className="metric-grid">
-        <div className="metric"><span>Target adjusted</span><strong><FloatValue value={plan.target_adjusted} /></strong><small>нужно среднее</small></div>
         <div className="metric"><span>Прогноз target float</span><strong><FloatValue value={plan.predicted_target_float} /></strong><small>{plan.target_wear.name}</small></div>
         <div className="metric"><span>Шанс названия</span><strong>{plan.target_probability}</strong><small>не зависит от float</small></div>
         <div className="metric"><span>Цена недостающих</span><strong>{plan.pricing_available ? money(plan.total_price_cents) : '—'}</strong><small>{plan.pricing_available ? 'проверенные кандидаты' : 'лоты не подключены'}</small></div>
       </div>
 
       <div className="card result-card">
-        <div className="section-heading"><div><p className="eyebrow">selected inputs</p><h2>10 слотов, сохранённый порядок</h2></div><span className="subtle">Допустимый output: <FloatValue value={plan.acceptable_output_range[0]} /> — <FloatValue value={plan.acceptable_output_range[1]} /></span></div>
+        <div className="section-heading"><div><h2>Предметы для контракта</h2></div><span className="subtle">Допустимый результат: <FloatValue value={plan.acceptable_output_range[0]} /> — <FloatValue value={plan.acceptable_output_range[1]} /></span></div>
         <div className="table-wrap"><table>
-          <thead><tr><th>Slot</th><th>Предмет</th><th>Exact float</th><th>Adjusted</th><th>Цена</th><th>Источник</th></tr></thead>
+          <thead><tr><th>№</th><th>Предмет</th><th>Float</th><th>Цена</th><th>Ссылка</th></tr></thead>
           <tbody>{plan.selected_inputs.map(input => <tr key={`${input.slot}-${input.listing_id ?? 'owned'}`}>
             <td><span className="slot">{input.slot}</span></td>
             <td><strong>{input.skin_name}</strong></td>
-            <td><FloatValue value={input.float_value} bits /></td>
-            <td><FloatValue value={input.adjusted_float} /></td>
+            <td><FloatValue value={input.float_value} /></td>
             <td>{input.owned ? 'ваш предмет' : money(input.price_cents)}</td>
-            <td>{input.market_url ? <><ExternalLink href={input.market_url}>{input.source} ↗</ExternalLink>{input.inspect_link && <> · <ExternalLink href={input.inspect_link}>inspect ↗</ExternalLink></>}</> : input.source}</td>
+            <td>{input.market_url ? <><ExternalLink href={input.market_url}>Открыть ↗</ExternalLink>{input.inspect_link && <> · <ExternalLink href={input.inspect_link}>Проверить ↗</ExternalLink></>}</> : '—'}</td>
           </tr>)}</tbody>
         </table></div>
       </div>
-      <div className="card result-card"><div className="section-heading"><div><p className="eyebrow">all outcomes</p><h2>Не смешиваем шанс и float</h2></div></div><OutcomeTable outcomes={plan.all_outcomes} /></div>
-      <Warnings messages={plan.warnings} />
+      <div className="card result-card"><div className="section-heading"><div><h2>Возможные результаты</h2></div></div><OutcomeTable outcomes={plan.all_outcomes} /></div>
     </section>}
 
-    <section className="container regression-section">
-      <div className="regression-card card">
-        <div className="section-heading">
-          <div><p className="eyebrow">evidence-backed regressions</p><h2>Набор фактических контрактов</h2><p>В базу попадёт только контракт, который сначала пересчитан локальным float32-ядром и снабжён публичным доказательством.</p></div>
-          <span className={`tag ${regressionStatus?.ready_for_target ? 'tag-ready' : ''}`}>{regressionStatus?.ready_for_target ? 'готово' : 'в сборе'}</span>
-        </div>
-        {regressionStatus ? <div className="progress-grid">
-          <div><span>Подтверждённые exact</span><strong>{regressionStatus.evidence_backed_exact_matches} / {regressionStatus.target_count}</strong><small>и evidence, и совпадение bits</small></div>
-          <div><span>С evidence</span><strong>{regressionStatus.evidence_backed_records}</strong><small>всего записей: {regressionStatus.count}</small></div>
-          <div><span>Расхождения</span><strong>{regressionStatus.mismatches}</strong><small>требуют отдельной проверки</small></div>
-          <div><span>Без evidence</span><strong>{regressionStatus.records_missing_evidence}</strong><small>старые локальные записи</small></div>
-        </div> : <p className="empty">Статус regression-набора временно недоступен.</p>}
-      </div>
-
-      <form className="collector card" onSubmit={event => { event.preventDefault(); void previewCollector() }}>
-        <div className="section-heading"><div><p className="eyebrow">new verified contract</p><h2>Добавить фактический контракт</h2><p>Стандартный normal-контракт: 10 input skins одной rarity без StatTrak. Сначала нажмите «Проверить», затем сохраните только просмотренный результат.</p></div><span className="tag">10 inputs</span></div>
-        <div className="collector-inputs">
-          {collectorInputs.map((input, index) => <div className="collector-row" key={index}>
-            <span className="slot">{index + 1}</span>
-            <select aria-label={`Input skin ${index + 1}`} value={input.skinId} onChange={event => updateCollectorInput(index, { skinId: event.target.value })}>
-              <option value="">Выберите входной skin</option>
-              {collectorSkinChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name} · {skin.collection_name} · {rarityLabel[skin.rarity]}</option>)}
-            </select>
-            <input aria-label={`Input float ${index + 1}`} inputMode="decimal" placeholder="Exact float" value={input.floatValue} onChange={event => updateCollectorInput(index, { floatValue: event.target.value })} />
-          </div>)}
-        </div>
-        <div className="form-grid two collector-output">
-          <label>Фактический output
-            <select value={actualOutputSkinId} onChange={event => { setActualOutputSkinId(event.target.value); resetCollectorPreview() }}>
-              <option value="">Выберите выпавший skin</option>
-              {catalog?.skins.map(skin => <option value={skin.id} key={skin.id}>{skin.name} · {skin.collection_name}</option>)}
-            </select>
-          </label>
-          <label>Exact output float<input inputMode="decimal" placeholder="например, 0.150000006" value={actualOutputFloat} onChange={event => { setActualOutputFloat(event.target.value); resetCollectorPreview() }} /></label>
-        </div>
-        <label className="collector-evidence">Публичная evidence URL<input type="url" placeholder="https://… — capture, video или публичный профиль с составом и output" value={evidenceUrl} onChange={event => { setEvidenceUrl(event.target.value); resetCollectorPreview() }} /></label>
-        <label className="collector-evidence">Комментарий <span className="optional">optional</span><input placeholder="Например: FN/MW boundary; порядок слотов 1→10" value={collectorNote} onChange={event => { setCollectorNote(event.target.value); resetCollectorPreview() }} /></label>
-        {collectorError && <p className="collector-error">{collectorError}</p>}
-        {collectorPreview && <div className={`collector-preview ${collectorPreview.exactMatch ? 'match' : 'mismatch'}`}>
-          <div><span>Прогноз API</span><strong><FloatValue value={collectorPreview.outcome.predicted_float} bits /></strong><small>{collectorPreview.outcome.skin_name} · {collectorPreview.outcome.wear.name}</small></div>
-          <div><span>Фактический float32</span><strong className="mono">{collectorPreview.actualFloat.toFixed(9)} <small>· 0x{collectorPreview.actualBits.toString(16).padStart(8, '0')}</small></strong><small>{collectorPreview.exactMatch ? 'bit-exact совпадение' : 'bits отличаются — запись сохранится как mismatch'}</small></div>
-          <div><span>Шанс output</span><strong>{collectorPreview.outcome.probability_percent}</strong><small>по составу коллекций</small></div>
-        </div>}
-        {collectorRecord && <div className={`collector-saved ${collectorRecord.exact_float32_match ? 'match' : 'mismatch'}`}>
-          Сохранено: {collectorRecord.exact_float32_match ? 'bit-exact совпадение' : 'расхождение зафиксировано'} · Δ <FloatValue value={collectorRecord.absolute_difference} bits /> · каталог {collectorRecord.catalog_schema_version}
-        </div>}
-        <div className="collector-actions">
-          <button className="secondary" disabled={collectorLoading} type="submit">{collectorLoading ? 'Проверяю…' : 'Проверить перед сохранением'}</button>
-          <button className="primary collector-save" disabled={collectorLoading || !collectorPreview} type="button" onClick={() => void submitCollector()}>{collectorLoading ? 'Сохраняю…' : 'Сохранить evidence-backed запись'}</button>
-        </div>
-      </form>
-    </section>
-
     <section className="container simulator card">
-      <div className="section-heading"><div><p className="eyebrow">forward validation</p><h2>Проверить ручной контракт</h2><p>Десять одинаковых входов — быстрый способ проверить float32-формулу и wear boundary.</p></div><span className="tag">manual</span></div>
+      <div className="section-heading"><div><h2>Проверить контракт</h2><p>Укажите предмет и float, чтобы посмотреть возможные результаты контракта.</p></div></div>
       <div className="manual-controls">
-        <label>Input skin<select value={manualSkinId} onChange={event => setManualSkinId(event.target.value)}>{inputChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name}</option>)}</select></label>
-        <label>Exact float<input inputMode="decimal" value={manualFloat} onChange={event => setManualFloat(event.target.value)} /></label>
+        <label>Предмет<select value={manualSkinId} onChange={event => setManualSkinId(event.target.value)}>{inputChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name}</option>)}</select></label>
+        <label>Float<input inputMode="decimal" value={manualFloat} onChange={event => setManualFloat(event.target.value)} /></label>
         <button className="secondary" onClick={() => simulate()} disabled={simulating || !manualSkinId}>{simulating ? 'Считаю…' : 'Симулировать 10 ×'}</button>
       </div>
-      {simulation && <div className="simulation-output"><div className="average">avg adjusted: <FloatValue value={simulation.average_adjusted} bits /></div><OutcomeTable outcomes={simulation.outcomes} /><Warnings messages={simulation.warnings} /></div>}
+      {simulation && <div className="simulation-output"><OutcomeTable outcomes={simulation.outcomes} /></div>}
     </section>
 
-    <section className="container limitations card"><p className="eyebrow">границы данных</p><h2>Что требует внешнего источника</h2><ul>{catalog?.limitations.map(item => <li key={item}>{item}</li>)}</ul><p>Полный catalog, float32-расчёт и reverse path работают локально. Для конкретных покупок всё ещё необходим provider, который законно отдаёт listing, inspect payload и exact float.</p></section>
-    <footer className="container footer">Floatcraft MVP · Rust API + React/TypeScript · catalog snapshot {catalog?.schema_version}</footer>
+    <footer className="container footer">Floatcraft</footer>
   </main>
-}
-
-function Warnings({ messages }: { messages: string[] }) {
-  return <div className="warnings">{messages.map(message => <p key={message}>⚑ {message}</p>)}</div>
 }
