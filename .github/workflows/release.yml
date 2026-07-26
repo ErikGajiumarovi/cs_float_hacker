@@ -36,6 +36,8 @@ jobs:
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --tags origin "refs/tags/$release_tag" >/dev/null; then
             echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "## CD skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Version $release_tag is already released or being released." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -179,3 +181,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+      - name: Write published release summary
+        run: |
+          {
+            echo "## Floatcraft $RELEASE_TAG published"
+            echo "- macOS ARM DMG and signed updater: ready"
+            echo "- Windows x64 NSIS installer and signed updater: ready"
+            echo "- [Open GitHub Release](https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG)"
+          } >> "$GITHUB_STEP_SUMMARY"
