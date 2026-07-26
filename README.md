@@ -1,5 +1,8 @@
 # Floatcraft
 
+[![CI](https://github.com/ErikGajiumarovi/cs_float_hacker/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ErikGajiumarovi/cs_float_hacker/actions/workflows/ci.yml)
+[![CD](https://github.com/ErikGajiumarovi/cs_float_hacker/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/ErikGajiumarovi/cs_float_hacker/actions/workflows/release.yml)
+
 Нативное desktop-приложение для расчёта CS2 trade-up контрактов: React UI в
 Tauri WebView и Rust-ядро с последовательной IEEE-754 `f32` математикой.
 Приложение не запускает localhost-сервер, не требует Docker и не отправляет
@@ -64,12 +67,10 @@ cd frontend && npm test && npm run build
 cargo check --manifest-path frontend/src-tauri/Cargo.toml
 ```
 
-GitHub Actions выполняет эти проверки на PR. Теги формата `vX.Y.Z` запускают
-release pipeline, но только если `X.Y.Z` совпадает с версиями manifest и tag
-указывает на коммит из `main`. После обязательной проверки и approval
-environment `release` macOS ARM и Windows x64 runners публикуют единый draft,
-который становится stable GitHub Release лишь после успешной сборки обеих
-платформ.
+GitHub Actions выполняет эти проверки на PR и после merge в `main`. Успешный
+CI на `main` автоматически создаёт tag `vX.Y.Z` только для новой версии,
+собирает и подписывает macOS ARM и Windows x64, проверяет updater manifest и
+публикует stable GitHub Release. Обычный merge без version bump CD пропускает.
 
 ## Ограничения public beta
 
