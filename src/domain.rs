@@ -215,6 +215,20 @@ pub struct AnalyzeRequest {
     pub inputs: Vec<InputRequest>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartialInputRequest {
+    pub skin_id: String,
+    #[serde(default)]
+    pub float_value: Option<f32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartialAnalyzeRequest {
+    #[serde(default)]
+    pub stattrak: bool,
+    pub inputs: Vec<PartialInputRequest>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InputAnalysis {
     pub slot: usize,
@@ -249,6 +263,29 @@ pub struct AnalyzeResponse {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PartialOutcomeAnalysis {
+    pub skin_id: String,
+    pub skin_name: String,
+    pub collection_name: String,
+    pub known_inputs_from_collection: usize,
+    /// Until all ten slots are chosen, the exact odds are unknown. These are
+    /// the lower and upper bounds permitted by the already selected inputs.
+    pub probability_min: f32,
+    pub probability_max: f32,
+    pub predicted_float_min: Float32Value,
+    pub predicted_float_max: Float32Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PartialAnalyzeResponse {
+    pub input_rarity: Rarity,
+    pub selected_slots: usize,
+    pub floats_specified: usize,
+    pub remaining_float_slots: usize,
+    pub outcomes: Vec<PartialOutcomeAnalysis>,
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedInput<'a> {
     skin: &'a Skin,
@@ -281,6 +318,98 @@ fn resolve_inputs<'a>(
             })
         })
         .collect()
+}
+
+/// Previews only the information that is already implied by a partially filled
+/// 10-item normal contract. Unknown slots are deliberately modeled as the full
+/// adjusted-float interval [0, 1], so the displayed float range is possible,
+/// not a fabricated exact prediction.
+pub fn preview_partial_contract(
+    catalog: &Catalog,
+    request: PartialAnalyzeRequest,
+) -> Result<PartialAnalyzeResponse, PlannerError> {
+    if request.inputs.is_empty() || request.inputs.len() > 10 {
+        return Err(PlannerError::Validation(
+            "choose between 1 and 10 contract inputs for a preview".to_owned(),
+        ));
+    }
+    let mut resolved = Vec::new();
+    for input in &request.inputs {
+        let skin = catalog.skin(&input.skin_id).ok_or_else(|| {
+            PlannerError::Validation(format!("unknown skin_id: {}", input.skin_id))
+        })?;
+        if request.stattrak && !skin.stattrak_supported {
+            return Err(PlannerError::Validation(format!(
+                "{} has no StatTrak variant in the catalog", skin.name
+            )));
+        }
+        if let Some(value) = input.float_value {
+            adjusted_float(value, skin)?;
+        }
+        resolved.push((skin, input.float_value));
+    }
+    let input_rarity = resolved[0].0.rarity;
+    if resolved.iter().any(|(skin, _)| skin.rarity != input_rarity) {
+        return Err(PlannerError::Validation(
+            "all selected contract inputs must have the same rarity".to_owned(),
+        ));
+    }
+    let output_rarity = input_rarity.next().ok_or_else(|| {
+        PlannerError::Validation("this input rarity has no standard 10-item trade-up tier".to_owned())
+    })?;
+
+    let mut known_sum = 0.0_f32;
+    let mut floats_specified = 0_usize;
+    let mut collection_counts = BTreeMap::<String, usize>::new();
+    for (skin, float_value) in &resolved {
+        *collection_counts.entry(skin.collection_id.clone()).or_default() += 1;
+        if let Some(value) = float_value {
+            known_sum = f32_add(known_sum, adjusted_float(*value, skin)?);
+            floats_specified += 1;
+        }
+    }
+    let remaining_float_slots = 10 - floats_specified;
+    let min_average = f32_div(known_sum, 10.0);
+    let max_average = f32_div(f32_add(known_sum, remaining_float_slots as f32), 10.0);
+
+    let mut outcomes = BTreeMap::<String, (usize, &Skin)>::new();
+    for (collection_id, count) in collection_counts {
+        let possible = catalog.outcomes_for_collection(&collection_id, output_rarity);
+        if possible.is_empty() {
+            return Err(PlannerError::Validation(format!(
+                "collection {collection_id} has no {:?} outcome for this trade-up", output_rarity
+            )));
+        }
+        for skin in possible {
+            let entry = outcomes.entry(skin.id.clone()).or_insert((0, skin));
+            entry.0 += count;
+        }
+    }
+    Ok(PartialAnalyzeResponse {
+        input_rarity,
+        selected_slots: resolved.len(),
+        floats_specified,
+        remaining_float_slots,
+        outcomes: outcomes
+            .into_values()
+            .map(|(known_inputs_from_collection, skin)| {
+                let outcomes_in_collection = catalog
+                    .outcomes_for_collection(&skin.collection_id, output_rarity)
+                    .len();
+                let divisor = outcomes_in_collection as f32;
+                PartialOutcomeAnalysis {
+                    skin_id: skin.id.clone(),
+                    skin_name: skin.name.clone(),
+                    collection_name: skin.collection_name.clone(),
+                    known_inputs_from_collection,
+                    probability_min: f32_div(known_inputs_from_collection as f32, 10.0 * divisor),
+                    probability_max: f32_div(1.0, divisor),
+                    predicted_float_min: Float32Value::new(output_float(min_average, skin)),
+                    predicted_float_max: Float32Value::new(output_float(max_average, skin)),
+                }
+            })
+            .collect(),
+    })
 }
 
 pub fn analyze_contract(
@@ -466,8 +595,6 @@ pub struct PlanRequest {
     #[serde(default)]
     pub owned_inputs: Vec<InputRequest>,
     #[serde(default)]
-    pub budget_cents: Option<u64>,
-    #[serde(default)]
     pub priority: PlanningPriority,
     #[serde(default)]
     pub listing_limit: Option<usize>,
@@ -549,18 +676,18 @@ fn better_choice(
     if candidate.within_target != current.within_target {
         return candidate.within_target;
     }
-    let candidate_budget_key = candidate.total_price_cents;
-    let current_budget_key = current.total_price_cents;
+    let candidate_price_key = candidate.total_price_cents;
+    let current_price_key = current.total_price_cents;
     match priority {
         PlanningPriority::Cheapest => {
             if candidate.within_target && current.within_target {
-                (candidate_budget_key, candidate.distance) < (current_budget_key, current.distance)
+                (candidate_price_key, candidate.distance) < (current_price_key, current.distance)
             } else {
-                (candidate.distance, candidate_budget_key) < (current.distance, current_budget_key)
+                (candidate.distance, candidate_price_key) < (current.distance, current_price_key)
             }
         }
         PlanningPriority::Closest => {
-            (candidate.distance, candidate_budget_key) < (current.distance, current_budget_key)
+            (candidate.distance, candidate_price_key) < (current.distance, current_price_key)
         }
     }
 }
@@ -574,7 +701,6 @@ fn search_combinations<'a>(
     acceptable_low: f32,
     acceptable_high: f32,
     target_center: f32,
-    budget_cents: Option<u64>,
     priority: &PlanningPriority,
     start: usize,
     selected: &mut Vec<&'a Candidate<'a>>,
@@ -585,9 +711,6 @@ fn search_combinations<'a>(
             .iter()
             .map(|candidate| candidate.listing.price_cents)
             .sum();
-        if budget_cents.is_some_and(|budget| total_price_cents > budget) {
-            return;
-        }
         let adjusted_values = owned
             .iter()
             .map(|input| {
@@ -620,7 +743,6 @@ fn search_combinations<'a>(
             acceptable_low,
             acceptable_high,
             target_center,
-            budget_cents,
             priority,
             index + 1,
             selected,
@@ -640,7 +762,6 @@ fn search_combinations_beam<'a>(
     acceptable_low: f32,
     acceptable_high: f32,
     target_center: f32,
-    budget_cents: Option<u64>,
     priority: &PlanningPriority,
 ) -> Option<ChosenPlan<'a>> {
     let owned_sum = owned.iter().fold(0.0_f32, |sum, input| {
@@ -668,9 +789,6 @@ fn search_combinations_beam<'a>(
                     let total_price_cents = state
                         .total_price_cents
                         .checked_add(candidate.listing.price_cents)?;
-                    if budget_cents.is_some_and(|budget| total_price_cents > budget) {
-                        return None;
-                    }
                     let mut chosen = state.candidates.clone();
                     chosen.push(candidate);
                     Some(BeamState {
@@ -844,7 +962,6 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
             acceptable_low,
             acceptable_high,
             target_center,
-            request.budget_cents,
             &request.priority,
             0,
             &mut selected,
@@ -865,7 +982,6 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
                 acceptable_low,
                 acceptable_high,
                 target_center,
-                request.budget_cents,
                 &request.priority,
             ),
             format!(
@@ -877,7 +993,7 @@ pub fn plan_reverse(catalog: &Catalog, request: PlanRequest) -> Result<PlanRespo
     };
     let Some(best) = best else {
         return Err(PlannerError::Validation(
-            "no candidate combination is within the supplied budget".to_owned(),
+            "no candidate combination could be selected".to_owned(),
         ));
     };
 
@@ -1158,6 +1274,35 @@ mod tests {
     }
 
     #[test]
+    fn partial_preview_exposes_possible_outcomes_and_an_honest_float_range() {
+        let catalog = Catalog::load_embedded().unwrap();
+        let preview = preview_partial_contract(
+            &catalog,
+            PartialAnalyzeRequest {
+                stattrak: false,
+                inputs: vec![PartialInputRequest {
+                    skin_id: "m4a1s-knight".to_owned(),
+                    float_value: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(preview.selected_slots, 1);
+        assert_eq!(preview.floats_specified, 0);
+        assert_eq!(preview.remaining_float_slots, 10);
+        let dragon_lore = preview
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.skin_id == "awp-dragon-lore")
+            .unwrap();
+        assert_eq!(dragon_lore.predicted_float_min.value, 0.0);
+        assert_eq!(dragon_lore.predicted_float_max.value, 0.7);
+        assert_eq!(dragon_lore.probability_min, 0.1);
+        assert_eq!(dragon_lore.probability_max, 1.0);
+    }
+
+    #[test]
     fn floatjitsu_regression_uses_sequential_f32_sum() {
         let cap_skin = Skin {
             id: "fixture".into(),
@@ -1254,7 +1399,6 @@ mod tests {
                         inspect_link: None,
                     })
                     .collect(),
-                budget_cents: None,
                 priority: PlanningPriority::Cheapest,
                 listing_limit: None,
             },
@@ -1288,7 +1432,6 @@ mod tests {
                 delta: 0.0001,
                 stattrak: false,
                 owned_inputs: Vec::new(),
-                budget_cents: None,
                 priority: PlanningPriority::Cheapest,
                 listing_limit: None,
             },
@@ -1327,7 +1470,6 @@ mod tests {
                 delta: 0.0001,
                 stattrak: false,
                 owned_inputs: Vec::new(),
-                budget_cents: None,
                 priority: PlanningPriority::Cheapest,
                 listing_limit: Some(200),
             },

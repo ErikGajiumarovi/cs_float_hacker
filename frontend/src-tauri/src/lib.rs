@@ -482,6 +482,16 @@ async fn analyze_contract(
 }
 
 #[tauri::command]
+async fn preview_partial_contract(
+    state: State<'_, DesktopRuntime>,
+    request: cs_float_planner::domain::PartialAnalyzeRequest,
+) -> Result<cs_float_planner::domain::PartialAnalyzeResponse, String> {
+    let catalog = state.catalog.read().await;
+    cs_float_planner::domain::preview_partial_contract(&catalog, request)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn plan_contract(
     state: State<'_, DesktopRuntime>,
     request: PlanRequest,
@@ -572,6 +582,7 @@ pub fn run() {
             acknowledge_live_market_notice,
             get_regression_status,
             analyze_contract,
+            preview_partial_contract,
             plan_contract,
             record_contract
         ])

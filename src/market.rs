@@ -724,7 +724,6 @@ mod tests {
             delta: 0.0001,
             stattrak: false,
             owned_inputs: Vec::new(),
-            budget_cents: None,
             priority: PlanningPriority::Cheapest,
             listing_limit: Some(200),
         };

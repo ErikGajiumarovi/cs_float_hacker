@@ -79,8 +79,28 @@ type Simulation = {
   warnings: string[]
 }
 
+type PartialOutcome = {
+  skin_id: string
+  skin_name: string
+  collection_name: string
+  known_inputs_from_collection: number
+  probability_min: number
+  probability_max: number
+  predicted_float_min: Float32
+  predicted_float_max: Float32
+}
+
+type PartialSimulation = {
+  input_rarity: Rarity
+  selected_slots: number
+  floats_specified: number
+  remaining_float_slots: number
+  outcomes: PartialOutcome[]
+}
+
 type OwnedInput = { skinId: string; floatValue: string }
-type TargetMode = 'exact' | 'maximum' | 'range'
+type TargetMode = 'exact' | 'range'
+type AppMode = 'plan' | 'simulate'
 
 type DesktopSettings = {
   marketEnabled: boolean
@@ -100,6 +120,16 @@ const rarityLabel: Record<Rarity, string> = {
 function money(cents: number | null) {
   if (cents === null) return '—'
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(cents / 100)
+}
+
+function hasFiniteFloat(value: string) {
+  return value.trim() !== '' && Number.isFinite(Number(value))
+}
+
+function percentRange(minimum: number, maximum: number) {
+  const min = `${(minimum * 100).toFixed(2)}%`
+  const max = `${(maximum * 100).toFixed(2)}%`
+  return min === max ? min : `${min} — ${max}`
 }
 
 function FloatValue({ value }: { value: Float32 }) {
@@ -145,8 +175,20 @@ function planSummary(status: string) {
     : 'Подходящий набор найден.'
 }
 
+function errorMessage(problem: unknown, fallback: string) {
+  if (problem instanceof Error && problem.message) return problem.message
+  if (typeof problem === 'string') return problem
+  if (typeof problem === 'object' && problem && 'message' in problem && typeof problem.message === 'string') return problem.message
+  return fallback
+}
+
+function blankSimulationInputs(): OwnedInput[] {
+  return Array.from({ length: 10 }, () => ({ skinId: '', floatValue: '' }))
+}
+
 export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null)
+  const [appMode, setAppMode] = useState<AppMode>('plan')
   const [targetSkinId, setTargetSkinId] = useState('')
   const [targetMode, setTargetMode] = useState<TargetMode>('exact')
   const [targetValue, setTargetValue] = useState('0.150000')
@@ -154,12 +196,12 @@ export default function App() {
   const [rangeMax, setRangeMax] = useState('0.150500')
   const [delta, setDelta] = useState('0.000100')
   const [priority, setPriority] = useState<'cheapest' | 'closest'>('cheapest')
-  const [budget, setBudget] = useState('')
   const [ownedInputs, setOwnedInputs] = useState<OwnedInput[]>([])
   const [plan, setPlan] = useState<Plan | null>(null)
   const [simulation, setSimulation] = useState<Simulation | null>(null)
-  const [manualSkinId, setManualSkinId] = useState('')
-  const [manualFloat, setManualFloat] = useState('0.02142857')
+  const [partialSimulation, setPartialSimulation] = useState<PartialSimulation | null>(null)
+  const [partialSimulationError, setPartialSimulationError] = useState<string | null>(null)
+  const [simulationInputs, setSimulationInputs] = useState<OwnedInput[]>(blankSimulationInputs)
   const [loading, setLoading] = useState(true)
   const [planning, setPlanning] = useState(false)
   const [simulating, setSimulating] = useState(false)
@@ -191,13 +233,18 @@ export default function App() {
     if (!catalog || !target) return []
     return catalog.skins.filter(skin => skin.collection_id === target.collection_id && skin.rarity === 'classified')
   }, [catalog, target])
-  const collectorSkinChoices = useMemo(() => catalog?.skins
+  const simulationSkinChoices = useMemo(() => catalog?.skins
     .filter(skin => skin.rarity !== 'covert' && skin.rarity !== 'extraordinary')
     .sort((left, right) => `${left.name} ${left.collection_name}`.localeCompare(`${right.name} ${right.collection_name}`)) ?? [], [catalog])
 
-  useEffect(() => {
-    if (inputChoices.length > 0) setManualSkinId(inputChoices[0].id)
-  }, [targetSkinId])
+  const simulationRarity = useMemo(() => {
+    const firstSkinId = simulationInputs.find(input => input.skinId)?.skinId
+    return simulationSkinChoices.find(skin => skin.id === firstSkinId)?.rarity ?? null
+  }, [simulationInputs, simulationSkinChoices])
+  const filteredSimulationSkinChoices = useMemo(() => simulationRarity
+    ? simulationSkinChoices.filter(skin => skin.rarity === simulationRarity)
+    : simulationSkinChoices, [simulationRarity, simulationSkinChoices])
+  const simulationReady = simulationInputs.every(input => input.skinId && hasFiniteFloat(input.floatValue))
 
   function addOwned() {
     if (!inputChoices[0]) return
@@ -210,6 +257,19 @@ export default function App() {
 
   function removeOwned(index: number) {
     setOwnedInputs(current => current.filter((_, position) => position !== index))
+  }
+
+  function updateSimulationInput(index: number, patch: Partial<OwnedInput>) {
+    setSimulationInputs(current => current.map((input, position) => position === index ? { ...input, ...patch } : input))
+    setSimulation(null)
+  }
+
+  function resetSimulation() {
+    setSimulationInputs(blankSimulationInputs())
+    setSimulation(null)
+    setPartialSimulation(null)
+    setPartialSimulationError(null)
+    setError(null)
   }
 
   async function requestPlan(event: FormEvent) {
@@ -226,23 +286,26 @@ export default function App() {
       target: targetPayload,
       delta: Number(delta),
       priority,
-      budget_cents: budget.trim() ? Math.round(Number(budget) * 100) : undefined,
       owned_inputs: ownedInputs.map(input => ({ skin_id: input.skinId, float_value: Number(input.floatValue) })),
     }
     try {
       setPlan(await backend.plan<Plan>(payload))
     } catch (problem) {
       setPlan(null)
-      setError(problem instanceof Error ? problem.message : 'Не удалось рассчитать план')
+      setError(errorMessage(problem, 'Не удалось рассчитать план'))
     } finally {
       setPlanning(false)
     }
   }
 
   async function simulate(inputs?: Array<{ skin_id: string; float_value: number }>) {
-    const actualInputs = inputs ?? Array.from({ length: 10 }, () => ({ skin_id: manualSkinId, float_value: Number(manualFloat) }))
+    if (!inputs && simulationInputs.some(input => !input.skinId || !hasFiniteFloat(input.floatValue))) {
+      setError('Для симуляции заполните все 10 предметов и их float.')
+      return
+    }
+    const actualInputs = inputs ?? simulationInputs.map(input => ({ skin_id: input.skinId, float_value: Number(input.floatValue) }))
     if (actualInputs.some(input => !input.skin_id || !Number.isFinite(input.float_value))) {
-      setError('Для симуляции нужны skin и конечное float-значение.')
+      setError('Для симуляции заполните все 10 предметов и их float.')
       return
     }
     setSimulating(true)
@@ -250,11 +313,39 @@ export default function App() {
     try {
       setSimulation(await backend.analyze<Simulation>({ contract_size: 10, stattrak: false, inputs: actualInputs }))
     } catch (problem) {
-      setError(problem instanceof Error ? problem.message : 'Не удалось проверить контракт')
+      setError(errorMessage(problem, 'Не удалось проверить контракт'))
     } finally {
       setSimulating(false)
     }
   }
+
+  useEffect(() => {
+    if (appMode !== 'simulate' || !simulationReady) return
+    const timer = window.setTimeout(() => { void simulate() }, 250)
+    return () => window.clearTimeout(timer)
+  }, [appMode, simulationInputs, simulationReady])
+
+  useEffect(() => {
+    if (appMode !== 'simulate') return
+    const inputs = simulationInputs
+      .filter(input => input.skinId)
+      .map(input => {
+        const floatValue = Number(input.floatValue)
+        return { skin_id: input.skinId, float_value: hasFiniteFloat(input.floatValue) && Number.isFinite(floatValue) ? floatValue : undefined }
+      })
+    if (!inputs.length) {
+      setPartialSimulation(null)
+      setPartialSimulationError(null)
+      return
+    }
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void backend.previewPartial<PartialSimulation>({ stattrak: false, inputs })
+        .then(result => { if (!cancelled) { setPartialSimulation(result); setPartialSimulationError(null) } })
+        .catch(problem => { if (!cancelled) { setPartialSimulation(null); setPartialSimulationError(errorMessage(problem, 'Не удалось построить предварительный прогноз')) } })
+    }, 150)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [appMode, simulationInputs])
 
   async function toggleMarket(enabled: boolean) {
     try {
@@ -286,14 +377,6 @@ export default function App() {
   if (loading) return <main className="loading"><div className="orbit" />Загрузка…</main>
 
   return <main>
-    <header className="hero">
-      <div className="hero-inner">
-        <div>
-          <h1>Float<span>craft</span></h1>
-        </div>
-      </div>
-    </header>
-
     {isTauri && settings && <section className="container desktop-banner">
       <label className="market-toggle"><input type="checkbox" checked={settings.marketEnabled} onChange={event => void toggleMarket(event.target.checked)} /> Получать live-лоты Steam Market</label>
       {settings.marketEnabled && !settings.liveMarketNoticeAcknowledged && <div className="market-disclosure">
@@ -309,51 +392,64 @@ export default function App() {
 
     {error && <section className="container error"><strong>Расчёт остановлен:</strong> {error}</section>}
 
+    <section className="container mode-switch" aria-label="Режим работы">
+      <button className={appMode === 'plan' ? 'mode-button active' : 'mode-button'} type="button" onClick={() => setAppMode('plan')}>
+        <strong>Хочу получить</strong><span>Подобрать предметы для покупки</span>
+      </button>
+      <button className={appMode === 'simulate' ? 'mode-button active' : 'mode-button'} type="button" onClick={() => setAppMode('simulate')}>
+        <strong>У меня есть предметы</strong><span>Симулировать контракт</span>
+      </button>
+    </section>
+
+    {appMode === 'plan' && <>
     <section className="container workspace">
       <form className="planner card" onSubmit={requestPlan}>
         <div className="section-heading"><div><h2>Что хотите получить?</h2></div><span className="tag">Контракт из 10 предметов</span></div>
-        <label>Целевой skin
-          <select value={targetSkinId} onChange={event => { setTargetSkinId(event.target.value); setPlan(null) }}>
-            {targetChoices.map(skin => <option key={skin.id} value={skin.id}>{skin.name} · {skin.collection_name}</option>)}
-          </select>
-        </label>
-        {target && <div className="cap-row"><span>Cap</span><span className="mono">{target.min_float.toFixed(9)}</span> — <span className="mono">{target.max_float.toFixed(9)}</span><span>· {rarityLabel[target.rarity]}</span></div>}
+        <div className="planner-layout">
+          <div className="planner-target">
+            <label>Целевой skin
+              <select value={targetSkinId} onChange={event => { setTargetSkinId(event.target.value); setPlan(null) }}>
+                {targetChoices.map(skin => <option key={skin.id} value={skin.id}>{skin.name} · {skin.collection_name}</option>)}
+              </select>
+            </label>
+            {target && <div className="cap-row"><span>Cap</span><span className="mono">{target.min_float.toFixed(9)}</span> — <span className="mono">{target.max_float.toFixed(9)}</span><span>· {rarityLabel[target.rarity]}</span></div>}
 
-        <div className="form-grid three">
-          <label>Тип цели
-            <select value={targetMode} onChange={event => setTargetMode(event.target.value as TargetMode)}>
-              <option value="exact">Точное значение</option>
-              <option value="maximum">Не выше</option>
-              <option value="range">Диапазон</option>
-            </select>
-          </label>
-          {targetMode === 'range' ? <>
-            <label>Min float<input inputMode="decimal" value={rangeMin} onChange={event => setRangeMin(event.target.value)} /></label>
-            <label>Max float<input inputMode="decimal" value={rangeMax} onChange={event => setRangeMax(event.target.value)} /></label>
-          </> : <label>Target float<input inputMode="decimal" value={targetValue} onChange={event => setTargetValue(event.target.value)} /></label>}
-          <label>δ результата<input inputMode="decimal" value={delta} onChange={event => setDelta(event.target.value)} /></label>
-        </div>
+            <div className="form-grid three">
+              <label>Тип цели
+                <select value={targetMode} onChange={event => setTargetMode(event.target.value as TargetMode)}>
+                  <option value="exact">Точное значение</option>
+                  <option value="range">Диапазон</option>
+                </select>
+              </label>
+              {targetMode === 'range' ? <>
+                <label>Min float<input inputMode="decimal" value={rangeMin} onChange={event => setRangeMin(event.target.value)} /></label>
+                <label>Max float<input inputMode="decimal" value={rangeMax} onChange={event => setRangeMax(event.target.value)} /></label>
+              </> : <label>Target float<input inputMode="decimal" value={targetValue} onChange={event => setTargetValue(event.target.value)} /></label>}
+              <label>δ результата<input inputMode="decimal" value={delta} onChange={event => setDelta(event.target.value)} /></label>
+            </div>
 
-        <div className="section-heading compact"><div><h3>Уже есть {ownedInputs.length} / 10</h3></div><button type="button" className="text-button" onClick={addOwned} disabled={!inputChoices.length || ownedInputs.length >= 10}>+ Добавить предмет</button></div>
-        {ownedInputs.length === 0 ? <p className="empty">Можно оставить пустым или добавить свои предметы.</p> : <div className="owned-list">
-          {ownedInputs.map((input, index) => <div className="owned-row" key={index}>
-            <span className="slot">{index + 1}</span>
-            <select value={input.skinId} onChange={event => updateOwned(index, { skinId: event.target.value })}>
-              {inputChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name}</option>)}
-            </select>
-            <input aria-label={`Float owned item ${index + 1}`} inputMode="decimal" value={input.floatValue} onChange={event => updateOwned(index, { floatValue: event.target.value })} />
-            <button type="button" className="icon-button" onClick={() => removeOwned(index)} aria-label="Удалить предмет">×</button>
-          </div>)}
-        </div>}
-
-        <div className="form-grid two lower-fields">
-          <label>Приоритет
-            <select value={priority} onChange={event => setPriority(event.target.value as 'cheapest' | 'closest')}>
-              <option value="cheapest">Самый дешёвый в цели</option>
-              <option value="closest">Самый близкий float</option>
-            </select>
-          </label>
-          <label>Бюджет, USD <span className="optional">optional</span><input inputMode="decimal" placeholder="например, 55000" value={budget} onChange={event => setBudget(event.target.value)} /></label>
+            <div className="form-grid lower-fields">
+              <label>Приоритет
+                <select value={priority} onChange={event => setPriority(event.target.value as 'cheapest' | 'closest')}>
+                  <option value="cheapest">Самый дешёвый в цели</option>
+                  <option value="closest">Самый близкий float</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div className="planner-owned">
+            <div className="section-heading compact"><div><h3>Уже есть {ownedInputs.length} / 10</h3></div><button type="button" className="text-button" onClick={addOwned} disabled={!inputChoices.length || ownedInputs.length >= 10}>+ Добавить предмет</button></div>
+            {ownedInputs.length === 0 ? <p className="empty">Можно оставить пустым или добавить свои предметы.</p> : <div className="owned-list">
+              {ownedInputs.map((input, index) => <div className="owned-row" key={index}>
+                <span className="slot">{index + 1}</span>
+                <select value={input.skinId} onChange={event => updateOwned(index, { skinId: event.target.value })}>
+                  {inputChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name}</option>)}
+                </select>
+                <input aria-label={`Float owned item ${index + 1}`} inputMode="decimal" value={input.floatValue} onChange={event => updateOwned(index, { floatValue: event.target.value })} />
+                <button type="button" className="icon-button" onClick={() => removeOwned(index)} aria-label="Удалить предмет">×</button>
+              </div>)}
+            </div>}
+          </div>
         </div>
         <button className="primary" disabled={planning || !target}>{planning ? 'Подбираю комбинацию…' : 'Подобрать предметы →'}</button>
       </form>
@@ -364,7 +460,7 @@ export default function App() {
       <div className="result-banner">
         <span className={`status ${plan.status}`}>{plan.status === 'closest' ? 'ближайший вариант' : 'подходит'}</span>
         <div><strong>{planSummary(plan.status)}</strong></div>
-        <button className="secondary" onClick={() => simulate(plan.selected_inputs.map(item => ({ skin_id: item.skin_id, float_value: item.float_value.value })))} disabled={simulating}>{simulating ? 'Проверяю…' : 'Проверить набор'}</button>
+        <button className="secondary" onClick={() => { setSimulationInputs(plan.selected_inputs.map(item => ({ skinId: item.skin_id, floatValue: String(item.float_value.value) }))); setAppMode('simulate') }} disabled={simulating}>{simulating ? 'Проверяю…' : 'Открыть в симуляторе'}</button>
       </div>
       <div className="metric-grid">
         <div className="metric"><span>Прогноз target float</span><strong><FloatValue value={plan.predicted_target_float} /></strong><small>{plan.target_wear.name}</small></div>
@@ -372,6 +468,7 @@ export default function App() {
         <div className="metric"><span>Цена недостающих</span><strong>{plan.pricing_available ? money(plan.total_price_cents) : '—'}</strong><small>{plan.pricing_available ? 'проверенные кандидаты' : 'лоты не подключены'}</small></div>
       </div>
 
+      <div className="result-columns">
       <div className="card result-card">
         <div className="section-heading"><div><h2>Предметы для контракта</h2></div><span className="subtle">Допустимый результат: <FloatValue value={plan.acceptable_output_range[0]} /> — <FloatValue value={plan.acceptable_output_range[1]} /></span></div>
         <div className="table-wrap"><table>
@@ -386,17 +483,33 @@ export default function App() {
         </table></div>
       </div>
       <div className="card result-card"><div className="section-heading"><div><h2>Возможные результаты</h2></div></div><OutcomeTable outcomes={plan.all_outcomes} /></div>
-    </section>}
-
-    <section className="container simulator card">
-      <div className="section-heading"><div><h2>Проверить контракт</h2><p>Укажите предмет и float, чтобы посмотреть возможные результаты контракта.</p></div></div>
-      <div className="manual-controls">
-        <label>Предмет<select value={manualSkinId} onChange={event => setManualSkinId(event.target.value)}>{inputChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name}</option>)}</select></label>
-        <label>Float<input inputMode="decimal" value={manualFloat} onChange={event => setManualFloat(event.target.value)} /></label>
-        <button className="secondary" onClick={() => simulate()} disabled={simulating || !manualSkinId}>{simulating ? 'Считаю…' : 'Симулировать 10 ×'}</button>
       </div>
-      {simulation && <div className="simulation-output"><OutcomeTable outcomes={simulation.outcomes} /></div>}
-    </section>
+    </section>}
+    </>}
+
+    {appMode === 'simulate' && <section className="container simulator card">
+      <div className="section-heading"><div><h2>Что у вас уже есть?</h2><p>Выберите 10 предметов и укажите их exact float. После заполнения последнего слота результаты появятся автоматически.</p></div><span className="tag">10 предметов</span></div>
+      <div className="simulation-rarity-note">{simulationRarity ? <>Выбрана rarity: <strong>{rarityLabel[simulationRarity]}</strong>. Для остальных слотов доступны только предметы той же rarity — как в CS2.</> : 'Выберите первый предмет — он задаст rarity для всего контракта.'}</div>
+      <div>
+        <div className="owned-list simulation-inputs">
+          {simulationInputs.map((input, index) => <div className="owned-row" key={index}>
+            <span className="slot">{index + 1}</span>
+            <select aria-label={`Предмет ${index + 1}`} value={input.skinId} onChange={event => updateSimulationInput(index, { skinId: event.target.value })}>
+              <option value="">Выберите предмет</option>
+              {filteredSimulationSkinChoices.map(skin => <option value={skin.id} key={skin.id}>{skin.name} · {skin.collection_name}</option>)}
+            </select>
+            <input aria-label={`Float предмета ${index + 1}`} inputMode="decimal" placeholder="Exact float" value={input.floatValue} onChange={event => updateSimulationInput(index, { floatValue: event.target.value })} />
+          </div>)}
+        </div>
+        <div className="simulation-status"><span>{simulationReady ? (simulating ? 'Пересчитываю…' : 'Контракт заполнен — результат обновляется автоматически.') : `Заполнено: ${simulationInputs.filter(input => input.skinId && hasFiniteFloat(input.floatValue)).length} / 10`}</span>{simulationRarity && <button type="button" className="text-button" onClick={resetSimulation}>Начать другой контракт</button>}</div>
+      </div>
+      {!simulationReady && partialSimulation && <div className="simulation-output partial-output">
+        <div className="section-heading compact"><div><h3>Что уже может выпасть</h3><p>Это предварительный список из выбранных коллекций. Незанятые слоты и float ещё могут расширить список outcomes и диапазон float.</p></div></div>
+        <div className="table-wrap"><table><thead><tr><th>Возможный результат</th><th>Шанс с текущими данными</th><th>Выбрано из коллекции</th><th>Возможный float</th></tr></thead><tbody>{partialSimulation.outcomes.map(outcome => <tr key={outcome.skin_id}><td><strong>{outcome.skin_name}</strong><span className="subtle">{outcome.collection_name}</span></td><td>{percentRange(outcome.probability_min, outcome.probability_max)}</td><td>{outcome.known_inputs_from_collection} / 10</td><td><FloatValue value={outcome.predicted_float_min} /> — <FloatValue value={outcome.predicted_float_max} /></td></tr>)}</tbody></table></div>
+      </div>}
+      {!simulationReady && partialSimulationError && <p className="simulation-error">{partialSimulationError}</p>}
+      {simulation && <div className="simulation-output"><div className="average">Средний adjusted float: <FloatValue value={simulation.average_adjusted} /></div><OutcomeTable outcomes={simulation.outcomes} /></div>}
+    </section>}
 
     <footer className="container footer">Floatcraft</footer>
   </main>

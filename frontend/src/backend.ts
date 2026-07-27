@@ -13,6 +13,7 @@ export const backend = {
   marketStatus: <T>() => call<T>('get_market_status'),
   regressionStatus: <T>() => call<T>('get_regression_status'),
   analyze: <T>(request: unknown) => call<T>('analyze_contract', { request }),
+  previewPartial: <T>(request: unknown) => call<T>('preview_partial_contract', { request }),
   plan: <T>(request: unknown) => call<T>('plan_contract', { request }),
   recordContract: <T>(submission: unknown) => call<T>('record_contract', { submission }),
   settings: <T>() => call<T>('get_settings'),
